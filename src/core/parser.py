@@ -88,6 +88,27 @@ async def parse_incident_query(
     if start_time == end_time:
         start_time = end_time - timedelta(hours=1)
 
+    # Extract structured tags from the alert text (Datadog alerts include them)
+    source_tags = _extract_tags_from_alert(query)
+
+    # Extract timestamps from Datadog monitor URL if present
+    url_start, url_end = _extract_timestamps_from_url(query)
+    if url_start and url_end:
+        start_time = url_start
+        end_time = url_end
+
+    # Extract monitor ID from URL if present
+    monitor_id = _extract_monitor_id(query)
+
+    # Extract monitor query if present
+    monitor_query = ""
+    monitor_match = re.search(
+        r"(?:avg|sum|max|min|count)\(last_\d+[mhd]\):.*?(?:>|<|>=|<=)\s*\d+",
+        query,
+    )
+    if monitor_match:
+        monitor_query = monitor_match.group(0)
+
     return IncidentQuery(
         raw_query=query,
         service=data.get("service", "unknown"),
@@ -95,4 +116,72 @@ async def parse_incident_query(
         start_time=start_time,
         end_time=end_time,
         environment=data.get("environment", "production"),
+        source_tags=source_tags,
+        monitor_id=monitor_id,
+        monitor_query=monitor_query,
     )
+
+
+def _extract_tags_from_alert(text: str) -> dict[str, str]:
+    """Extract Datadog tags from alert text.
+
+    Looks for patterns like:
+    - container_name:query-server
+    - kube_namespace:mercari-search-platform-prod
+    - cluster-name:citadel-2g-prod-tokyo-01
+    - Tags section: container_name:query-server, kube_deployment:query-server
+    """
+    tags: dict[str, str] = {}
+
+    # Known tag keys to extract
+    tag_keys = [
+        "kube_namespace", "kube_deployment", "kube_service",
+        "container_name", "kube_container_name",
+        "pod_name", "kube_pod_name",
+        "cluster-name", "kube_cluster_name",
+        "env", "environment", "service", "app",
+    ]
+
+    for key in tag_keys:
+        # Match tag:value patterns (value is alphanumeric with hyphens, dots, underscores)
+        pattern = rf"{re.escape(key)}:([a-zA-Z0-9._-]+)"
+        match = re.search(pattern, text)
+        if match:
+            tags[key] = match.group(1)
+
+    return tags
+
+
+def _extract_monitor_id(text: str) -> int | None:
+    """Extract monitor ID from a Datadog monitor URL."""
+    match = re.search(r"monitors/(\d+)", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _extract_timestamps_from_url(text: str) -> tuple[datetime | None, datetime | None]:
+    """Extract from_ts and to_ts from a Datadog monitor URL in the text."""
+    from_match = re.search(r"from_ts=(\d+)", text)
+    to_match = re.search(r"to_ts=(\d+)", text)
+
+    start = None
+    end = None
+
+    if from_match:
+        try:
+            start = datetime.fromtimestamp(
+                int(from_match.group(1)) / 1000, tz=timezone.utc
+            )
+        except (ValueError, OSError):
+            pass
+
+    if to_match:
+        try:
+            end = datetime.fromtimestamp(
+                int(to_match.group(1)) / 1000, tz=timezone.utc
+            )
+        except (ValueError, OSError):
+            pass
+
+    return start, end
