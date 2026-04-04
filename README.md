@@ -273,4 +273,4 @@ sre-agent/
 
 ## License
 
-This project is private and not licensed for redistribution.
+This project is licensed under the [MIT License](LICENSE).
