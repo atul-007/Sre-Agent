@@ -432,7 +432,7 @@ class InvestigationEngine:
                 dash_id = dash.get("id", "")
                 if dash_id:
                     ctx.dashboard_ids.append(dash_id)
-                dash_metrics = self.dd_client.extract_metrics_from_dashboard(dash)
+                dash_metrics = DatadogClient.extract_metrics_from_dashboard(dash)
                 ctx.dashboard_metrics.extend(dash_metrics)
                 logger.info(
                     "  Dashboard '%s': found %d metrics",
