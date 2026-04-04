@@ -195,6 +195,7 @@ class DiscoveredContext(BaseModel):
     resolved_tags: dict[str, str] = Field(default_factory=dict)
     dashboard_metrics: list[str] = Field(default_factory=list)
     dashboard_ids: list[str] = Field(default_factory=list)
+    monitor_metrics: list[str] = Field(default_factory=list)
     infra_metrics: list[str] = Field(default_factory=list)
     container_metrics: list[str] = Field(default_factory=list)
     apm_metrics: list[str] = Field(default_factory=list)

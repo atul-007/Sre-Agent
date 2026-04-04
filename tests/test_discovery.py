@@ -14,6 +14,7 @@ from src.models.incident import (
     SymptomType,
 )
 from src.investigation.engine import InvestigationEngine
+from src.models.incident import TrackedHypothesis, HypothesisStatus
 
 
 # ── DiscoveredContext Model Tests ────────────────────────────────────
@@ -302,6 +303,7 @@ class TestDiscoverServiceContextIntegration:
         dd.get_metric_tag_values = AsyncMock(return_value=[])
         dd.find_dashboards_for_service = AsyncMock(return_value=[])
         dd.search_hosts_by_tag = AsyncMock(return_value=[])
+        dd.search_monitors = AsyncMock(return_value=[])
 
         ctx = await engine._discover_service_context(incident)
 
@@ -318,6 +320,7 @@ class TestDiscoverServiceContextIntegration:
         dd.find_dashboards_for_service = AsyncMock(return_value=[])
         dd.search_hosts_by_tag = AsyncMock(return_value=[])
         dd.get_metric_tag_values = AsyncMock(return_value=[])
+        dd.search_monitors = AsyncMock(return_value=[])
 
         # Namespace probe: fail for base, succeed for -prod
         call_count = 0
@@ -349,6 +352,7 @@ class TestDiscoverServiceContextIntegration:
         dd.query_metrics = AsyncMock(return_value=[])
         dd.get_metric_tag_values = AsyncMock(return_value=[])
         dd.search_hosts_by_tag = AsyncMock(return_value=[])
+        dd.search_monitors = AsyncMock(return_value=[])
 
         # Mock dashboard mining
         dd.find_dashboards_for_service = AsyncMock(return_value=[
@@ -382,6 +386,7 @@ class TestDiscoverServiceContextIntegration:
         dd.query_metrics = AsyncMock(return_value=[])
         dd.get_metric_tag_values = AsyncMock(return_value=[])
         dd.find_dashboards_for_service = AsyncMock(return_value=[])
+        dd.search_monitors = AsyncMock(return_value=[])
 
         # Host tag lookup returns useful tags
         dd.search_hosts_by_tag = AsyncMock(return_value=[
@@ -411,7 +416,83 @@ class TestDiscoverServiceContextIntegration:
         dd.find_dashboards_for_service = AsyncMock(side_effect=Exception("API error"))
         dd.search_hosts_by_tag = AsyncMock(side_effect=Exception("API error"))
 
+        dd.search_monitors = AsyncMock(side_effect=Exception("API error"))
+
         ctx = await engine._discover_service_context(incident)
         # Should return empty context, not crash
         assert ctx.available_metrics == []
         assert ctx.resolved_namespace == ""
+
+
+# ── Hypothesis Matching Tests ────────────────────────────────────────
+
+
+class TestHypothesisMatching:
+    def _make_engine(self):
+        config = AgentConfig()
+        dd = MagicMock()
+        reasoning = MagicMock()
+        correlation = MagicMock()
+        engine = InvestigationEngine(dd, reasoning, correlation, config)
+        engine.state = InvestigationState()
+        return engine
+
+    def test_exact_id_match(self):
+        engine = self._make_engine()
+        engine.state.hypotheses["h1"] = TrackedHypothesis(
+            id="h1", description="CPU saturation due to high request rate"
+        )
+        result = engine._find_matching_hypothesis("h1", "whatever")
+        assert result == "h1"
+
+    def test_description_similarity_match(self):
+        engine = self._make_engine()
+        engine.state.hypotheses["h1"] = TrackedHypothesis(
+            id="h1", description="CPU saturation caused by high request rate"
+        )
+        # Similar description, different ID
+        result = engine._find_matching_hypothesis("h99", "CPU saturation from high request rate")
+        assert result == "h1"
+
+    def test_no_match_for_different_hypothesis(self):
+        engine = self._make_engine()
+        engine.state.hypotheses["h1"] = TrackedHypothesis(
+            id="h1", description="CPU saturation caused by high request rate"
+        )
+        result = engine._find_matching_hypothesis("h99", "Memory leak in connection pool")
+        assert result is None
+
+    def test_next_hypothesis_id(self):
+        engine = self._make_engine()
+        assert engine._next_hypothesis_id() == "h1"
+
+        engine.state.hypotheses["h1"] = TrackedHypothesis(id="h1", description="test")
+        assert engine._next_hypothesis_id() == "h2"
+
+        engine.state.hypotheses["h5"] = TrackedHypothesis(id="h5", description="test")
+        assert engine._next_hypothesis_id() == "h6"
+
+
+# ── Monitor Metric Extraction Tests ──────────────────────────────────
+
+
+class TestExtractMetricsFromMonitors:
+    def test_extracts_from_query(self):
+        monitors = [
+            {"query": "avg(last_5m):avg:system.cpu.user{service:my-svc} > 90"},
+            {"query": "avg(last_5m):sum:trace.http.request.errors{service:my-svc}.as_count() > 10"},
+        ]
+        metrics = DatadogClient.extract_metrics_from_monitors(monitors)
+        assert "system.cpu.user" in metrics
+        assert "trace.http.request.errors" in metrics
+
+    def test_handles_empty(self):
+        assert DatadogClient.extract_metrics_from_monitors([]) == []
+
+    def test_handles_complex_query(self):
+        monitors = [
+            {"query": "avg(last_10m):avg:kubernetes.cpu.usage.total{kube_namespace:prod} / avg:kubernetes.cpu.limits{kube_namespace:prod} * 100 > 80"},
+        ]
+        metrics = DatadogClient.extract_metrics_from_monitors(monitors)
+        assert "kubernetes.cpu.usage.total" in metrics
+        assert "kubernetes.cpu.limits" in metrics

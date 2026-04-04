@@ -653,6 +653,48 @@ class DatadogClient:
         return all_series
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def search_monitors(
+        self,
+        query: str = "",
+        tags: Optional[list[str]] = None,
+    ) -> list[dict]:
+        """Search for all monitors matching a query or tag filter.
+
+        Returns full monitor definitions including their metric queries.
+        """
+        params: dict[str, Any] = {}
+        if query:
+            params["query"] = query
+        if tags:
+            params["monitor_tags"] = ",".join(tags)
+        resp = await self._client.get("/api/v1/monitor", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    @staticmethod
+    def extract_metrics_from_monitors(monitors: list[dict]) -> list[str]:
+        """Extract metric names from monitor query definitions."""
+        import re as _re
+
+        metrics: set[str] = set()
+        for mon in monitors:
+            query = mon.get("query", "")
+            if isinstance(query, str) and query:
+                for match in _re.finditer(
+                    r"(?:avg|sum|max|min|count|percentile)\(?:?([a-zA-Z0-9_.]+)\{",
+                    query,
+                ):
+                    metrics.add(match.group(1))
+                # Also try simpler pattern without aggregation prefix
+                for match in _re.finditer(
+                    r"([a-zA-Z][a-zA-Z0-9_.]+\.[a-zA-Z][a-zA-Z0-9_.]+)\{",
+                    query,
+                ):
+                    metrics.add(match.group(1))
+        return sorted(metrics)
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     async def get_triggered_monitors(
         self,
         service: str,

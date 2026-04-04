@@ -445,7 +445,32 @@ class InvestigationEngine:
         # Deduplicate dashboard metrics
         ctx.dashboard_metrics = sorted(set(ctx.dashboard_metrics))
 
-        # 6. If we still have no resolved tags, try host-based tag discovery
+        # 6. Monitor mining — find monitors for the service and extract their metrics
+        try:
+            monitors = await self.dd_client.search_monitors(
+                tags=[f"service:{service}"]
+            )
+            if not monitors:
+                # Try broader search by service name in query
+                monitors = await self.dd_client.search_monitors(query=service)
+
+            if monitors:
+                monitor_metrics = DatadogClient.extract_metrics_from_monitors(monitors)
+                # Add monitor metrics to discovered metrics (they're team-validated)
+                for m in monitor_metrics:
+                    if m not in ctx.dashboard_metrics:
+                        ctx.dashboard_metrics.append(m)
+                    if m not in all_found_metrics:
+                        all_found_metrics.add(m)
+                        ctx.available_metrics = sorted(all_found_metrics)
+                logger.info(
+                    "  Monitor mining: %d monitors, %d metrics extracted",
+                    len(monitors), len(monitor_metrics),
+                )
+        except Exception as e:
+            logger.warning("  Monitor mining failed: %s", e)
+
+        # 7. If we still have no resolved tags, try host-based tag discovery
         if not ctx.resolved_tags:
             try:
                 hosts = await self.dd_client.search_hosts_by_tag(f"service:{service}")
