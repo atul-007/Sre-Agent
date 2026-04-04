@@ -200,9 +200,10 @@ class TestCanConclude:
         state = InvestigationState(
             signal_checklist=build_signal_checklist(SymptomType.SATURATION.value),
         )
-        # Mark all checked
+        # Mark all checked with data_found=True (v3 requirement)
         for sig in state.signal_checklist:
             state.signal_checklist[sig].checked = True
+            state.signal_checklist[sig].data_found = True
         # Need at least one hypothesis with evidence
         state.hypotheses = {
             "h1": TrackedHypothesis(
@@ -220,6 +221,7 @@ class TestCanConclude:
         )
         for sig in state.signal_checklist:
             state.signal_checklist[sig].checked = True
+            state.signal_checklist[sig].data_found = True
         state.hypotheses = {
             "h1": TrackedHypothesis(id="h1", description="test")
         }

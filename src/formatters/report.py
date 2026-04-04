@@ -13,8 +13,16 @@ class ReportFormatter:
         """Render the RCA report as a detailed Markdown document."""
         lines: list[str] = []
 
-        # Header
-        lines.append(f"# Incident Investigation Report")
+        # v3: Report type header
+        is_summary = getattr(report, "report_type", "rca") == "investigation_summary"
+        if is_summary:
+            lines.append("# Investigation Summary")
+            lines.append(
+                "> *This investigation did not reach sufficient confidence for a Root Cause Analysis. "
+                "The findings below describe what was observed and what data was unavailable.*"
+            )
+        else:
+            lines.append("# Incident Investigation Report")
         lines.append(f"**Service:** {report.incident.service}")
         lines.append(f"**Time Window:** {report.incident.start_time} → {report.incident.end_time}")
         lines.append(f"**Query:** {report.incident.raw_query}")
@@ -133,15 +141,46 @@ class ReportFormatter:
                         lines.append(f"  - (-) {ev}")
                 lines.append("")
 
-            # v2: Signal Coverage
+            # v3: Data Quality table (replaces v2 signal coverage)
             if trace.investigation_state and trace.investigation_state.signal_checklist:
-                lines.append("### Signal Coverage")
+                lines.append("### Data Quality")
+                lines.append("| Signal | Status | Quality | Data Found | Notes |")
+                lines.append("|--------|--------|---------|------------|-------|")
                 for sig_key, result in trace.investigation_state.signal_checklist.items():
                     if result.checked:
-                        data_note = "data found" if result.data_found else "no data"
-                        lines.append(f"- [x] {sig_key} ({data_note})")
+                        status = "[x]"
+                        quality_labels = {0.0: "Empty", 0.5: "Partial", 1.0: "Complete"}
+                        quality_label = quality_labels.get(result.data_quality, f"{result.data_quality:.1f}")
+                        data_found = "Yes" if result.data_found else "No"
+                        notes = result.notes[:60] if result.notes else ""
                     else:
-                        lines.append(f"- [ ] {sig_key}")
+                        status = "[ ]"
+                        quality_label = "—"
+                        data_found = "—"
+                        notes = "Not checked"
+                    lines.append(
+                        f"| {sig_key} | {status} | {quality_label} | {data_found} | {notes} |"
+                    )
+                lines.append("")
+
+            # v3: What We Don't Know (data gaps)
+            data_gaps = getattr(report, "data_gaps", [])
+            if data_gaps:
+                lines.append("### What We Don't Know")
+                for gap in data_gaps:
+                    lines.append(f"- **{gap.signal}**: {gap.failure_reason}")
+                    if gap.impact:
+                        lines.append(f"  - *Impact:* {gap.impact}")
+                    if gap.recommendation:
+                        lines.append(f"  - *Recommendation:* {gap.recommendation}")
+                lines.append("")
+
+            # v3: Recommended Next Steps
+            next_steps = getattr(report, "recommended_next_steps", [])
+            if next_steps:
+                lines.append("### Recommended Next Steps")
+                for i, step in enumerate(next_steps, 1):
+                    lines.append(f"{i}. {step}")
                 lines.append("")
 
             lines.append("<details>")
@@ -176,12 +215,18 @@ class ReportFormatter:
     @staticmethod
     def to_slack_blocks(report: RCAReport) -> list[dict]:
         """Render the RCA report as Slack Block Kit blocks for posting to Slack."""
+        is_summary = getattr(report, "report_type", "rca") == "investigation_summary"
+        header_text = (
+            f"Investigation Summary: {report.incident.service}"
+            if is_summary
+            else f"RCA: {report.incident.service}"
+        )
         blocks: list[dict] = [
             {
                 "type": "header",
                 "text": {
                     "type": "plain_text",
-                    "text": f"🔍 RCA: {report.incident.service}",
+                    "text": header_text,
                 },
             },
             {
@@ -321,6 +366,39 @@ class ReportFormatter:
                         },
                     }
                 )
+
+        # v3: Data gaps (Slack)
+        data_gaps = getattr(report, "data_gaps", [])
+        if data_gaps:
+            gap_lines = []
+            for gap in data_gaps[:5]:
+                gap_lines.append(f":warning: *{gap.signal}*: {gap.failure_reason}")
+                if gap.recommendation:
+                    gap_lines.append(f"    _Recommendation: {gap.recommendation}_")
+            blocks.append({"type": "divider"})
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "*Data Gaps:*\n" + "\n".join(gap_lines),
+                    },
+                }
+            )
+
+        # v3: Next steps for low-confidence (Slack)
+        next_steps = getattr(report, "recommended_next_steps", [])
+        if next_steps:
+            steps_text = "\n".join(f"• {step}" for step in next_steps[:5])
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Recommended Next Steps:*\n{steps_text}",
+                    },
+                }
+            )
 
         # Datadog deep links (when triggered from a monitor alert)
         if report.incident.monitor_id:

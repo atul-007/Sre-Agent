@@ -254,6 +254,7 @@ def calibrate_confidence(
     - >50% empty fetches → cap at confidence_cap_sparse
     - No direct supporting evidence for any hypothesis → cap at confidence_cap_no_evidence
     - >80% only if 2+ supporting evidence and 0 contradicting for top hypothesis
+    - Average data quality < 0.3 → cap at 0.45
     """
     calibrated = min(max(raw_confidence, 0.0), 1.0)
 
@@ -265,6 +266,17 @@ def calibrate_confidence(
             logger.debug(
                 "Confidence capped at %.0f%% (%.0f%% empty fetches)",
                 confidence_cap_sparse * 100, empty_ratio * 100,
+            )
+
+    # Rule 1b: Low data quality cap
+    checked_signals = [r for r in state.signal_checklist.values() if r.checked]
+    if checked_signals:
+        avg_quality = sum(r.data_quality for r in checked_signals) / len(checked_signals)
+        if avg_quality < 0.3:
+            calibrated = min(calibrated, 0.45)
+            logger.debug(
+                "Confidence capped at 45%% (avg data quality %.2f < 0.3)",
+                avg_quality,
             )
 
     # Rule 2: No direct evidence cap
@@ -294,6 +306,7 @@ def can_conclude(
     """Check if the investigation has enough coverage to conclude.
 
     Returns (can_conclude, reason).
+    v3: Also requires data_found=True for >=50% of checked signals.
     """
     checklist = state.signal_checklist
     if not checklist:
@@ -306,6 +319,19 @@ def can_conclude(
     if coverage < min_coverage:
         unchecked = get_unchecked_signals(checklist)
         return False, f"Signal coverage {coverage:.0%} < {min_coverage:.0%}. Missing: {', '.join(unchecked[:5])}"
+
+    # v3: Require data_found for at least 50% of checked signals
+    if checked > 0:
+        with_data = sum(1 for r in checklist.values() if r.checked and r.data_found)
+        data_ratio = with_data / checked
+        if data_ratio < 0.5:
+            empty_signals = [
+                sig for sig, r in checklist.items() if r.checked and not r.data_found
+            ]
+            return False, (
+                f"Only {data_ratio:.0%} of checked signals returned data. "
+                f"Empty: {', '.join(empty_signals[:5])}"
+            )
 
     # At least one hypothesis must have evidence
     has_evidence = any(
