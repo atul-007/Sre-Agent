@@ -629,7 +629,18 @@ class InvestigationEngine:
             return data, summary
 
         elif action_type == InvestigationActionType.FETCH_LOGS:
-            data = await self.dd_client.fetch_service_logs(service, start, end)
+            # Pass discovered namespace/container for broader log search
+            namespace = ""
+            container_name = ""
+            if self.state and self.state.discovered_context:
+                ctx = self.state.discovered_context
+                namespace = ctx.resolved_namespace
+                container_name = ctx.resolved_tags.get("kube_container_name", "")
+            data = await self.dd_client.fetch_service_logs(
+                service, start, end,
+                namespace=namespace,
+                container_name=container_name,
+            )
             summary = f"{len(data)} log entries for {service}"
             return data, summary
 

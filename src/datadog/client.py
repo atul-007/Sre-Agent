@@ -302,16 +302,22 @@ class DatadogClient:
         start: datetime,
         end: datetime,
     ) -> list[MetricSeries]:
-        """Fetch standard service-level metrics (latency, errors, throughput)."""
+        """Fetch standard service-level metrics (latency, errors, throughput).
+
+        Tries APM trace metrics first (works for HTTP-instrumented services),
+        then falls back to system-level metrics.
+        """
         queries = [
+            # APM metrics (may not exist for non-HTTP services like Flink)
             f"avg:trace.http.request.duration{{service:{service}}}",
             f"sum:trace.http.request.errors{{service:{service}}}.as_count()",
             f"sum:trace.http.request.hits{{service:{service}}}.as_count()",
-            f"avg:trace.http.request.duration.by.resource_name{{service:{service}}}",
+            # System metrics
             f"max:system.cpu.user{{service:{service}}}",
             f"avg:system.mem.used{{service:{service}}}",
-            f"avg:system.disk.in_use{{service:{service}}}",
-            f"avg:system.net.bytes_rcvd{{service:{service}}}",
+            # Container metrics (broader compatibility)
+            f"avg:container.cpu.usage{{service:{service}}}",
+            f"avg:container.memory.usage{{service:{service}}}",
         ]
         tasks = [self.query_metrics(q, start, end) for q in queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -372,19 +378,49 @@ class DatadogClient:
         service: str,
         start: datetime,
         end: datetime,
+        namespace: str = "",
+        container_name: str = "",
     ) -> list[LogEntry]:
-        """Fetch error and warning logs for a service."""
+        """Fetch error and warning logs for a service.
+
+        Searches using multiple tag combinations to maximize coverage:
+        - service:<name>
+        - kube_namespace:<namespace> (if provided)
+        - container_name:<name> (if provided)
+        - source:<service-related>
+        """
         queries = [
             f"service:{service} status:error",
             f"service:{service} status:warn",
         ]
+
+        # Broaden search with namespace tag
+        if namespace:
+            queries.append(f"kube_namespace:{namespace} status:error")
+
+        # Try container name
+        if container_name:
+            queries.append(f"kube_container_name:{container_name} status:error")
+
+        # Try partial service name (e.g., last 2-3 segments)
+        parts = service.split("-")
+        if len(parts) > 2:
+            short_name = "-".join(parts[-2:])
+            queries.append(f"*{short_name}* status:error")
+
         tasks = [self.search_logs(q, start, end, limit=500) for q in queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_logs: list[LogEntry] = []
+        seen_msgs: set[str] = set()
         for r in results:
             if isinstance(r, list):
-                all_logs.extend(r)
+                for log in r:
+                    # Deduplicate by timestamp + message prefix
+                    key = f"{log.timestamp}:{log.message[:50]}"
+                    if key not in seen_msgs:
+                        seen_msgs.add(key)
+                        all_logs.append(log)
             elif isinstance(r, Exception):
                 logger.warning("Log search failed: %s", r)
 
@@ -580,16 +616,31 @@ class DatadogClient:
         start: datetime,
         end: datetime,
     ) -> list[MetricSeries]:
-        """Fetch K8s infrastructure metrics (CPU, memory, restarts, throttling) for given tags."""
+        """Fetch K8s infrastructure metrics for given tags.
+
+        Includes: CPU usage/limits/throttling, memory usage/limits,
+        pod restarts, OOMKills, pod status, network, and disk.
+        """
         tag_filter = ",".join(f"{k}:{v}" for k, v in tags.items())
         queries = [
+            # CPU
             f"avg:kubernetes.cpu.usage.total{{{tag_filter}}}",
-            f"avg:kubernetes.memory.usage{{{tag_filter}}}",
-            f"sum:kubernetes.containers.restarts{{{tag_filter}}}.as_count()",
             f"avg:kubernetes.cpu.limits{{{tag_filter}}}",
             f"avg:kubernetes.cpu.requests{{{tag_filter}}}",
-            f"avg:kubernetes.memory.limits{{{tag_filter}}}",
             f"avg:container.cpu.throttled{{{tag_filter}}}",
+            f"avg:container.cpu.usage{{{tag_filter}}}",
+            # Memory
+            f"avg:kubernetes.memory.usage{{{tag_filter}}}",
+            f"avg:kubernetes.memory.limits{{{tag_filter}}}",
+            f"avg:container.memory.usage{{{tag_filter}}}",
+            # Pod health
+            f"sum:kubernetes.containers.restarts{{{tag_filter}}}.as_count()",
+            f"sum:kubernetes_state.container.status_report.count.waiting{{{tag_filter}}}",
+            f"max:kubernetes_state.container.oom_killed{{{tag_filter}}}",
+            f"avg:kubernetes.pods.running{{{tag_filter}}}",
+            # Network
+            f"avg:kubernetes.network.rx_bytes{{{tag_filter}}}",
+            f"avg:kubernetes.network.tx_bytes{{{tag_filter}}}",
         ]
         tasks = [self.query_metrics(q, start, end) for q in queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)
