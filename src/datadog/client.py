@@ -191,8 +191,8 @@ class DatadogClient:
 
         matching: list[dict] = []
         for dash in all_dashboards:
-            title = dash.get("title", "").lower()
-            desc = dash.get("description", "").lower()
+            title = (dash.get("title") or "").lower()
+            desc = (dash.get("description") or "").lower()
             if any(term in title or term in desc for term in search_terms):
                 matching.append(dash)
 

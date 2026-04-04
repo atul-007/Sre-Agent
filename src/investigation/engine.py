@@ -450,9 +450,13 @@ class InvestigationEngine:
             monitors = await self.dd_client.search_monitors(
                 tags=[f"service:{service}"]
             )
-            if not monitors:
-                # Try broader search by service name in query
-                monitors = await self.dd_client.search_monitors(query=service)
+            if not monitors and ctx.resolved_namespace:
+                # Try namespace-based search instead of broad service name search
+                monitors = await self.dd_client.search_monitors(
+                    query=ctx.resolved_namespace
+                )
+                # Limit to reasonable size to avoid downloading all monitors
+                monitors = monitors[:100]
 
             if monitors:
                 monitor_metrics = DatadogClient.extract_metrics_from_monitors(monitors)
@@ -986,7 +990,6 @@ class InvestigationEngine:
                         created_at_step=step_number,
                         last_updated_step=step_number,
                     )
-                    h.last_updated_step = step_number
             return
 
         # Fallback: parse old-style hypotheses list (list[str])
