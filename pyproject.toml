@@ -1,0 +1,32 @@
+[project]
+name = "sre-agent"
+version = "0.1.0"
+description = "AI-powered SRE Investigation Agent using Claude and Datadog"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.42.0",
+    "datadog-api-client>=2.20.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.5.0",
+    "rich>=13.7.0",
+    "tenacity>=8.2.0",
+    "structlog>=24.1.0",
+]
+
+[project.optional-dependencies]
+slack = [
+    "slack-bolt>=1.18.0",
+    "slack-sdk>=3.27.0",
+    "aiohttp>=3.9.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+    "ruff>=0.4.0",
+    "mypy>=1.8.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

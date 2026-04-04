@@ -1,0 +1,425 @@
+"""Datadog API client for fetching observability data."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Any, Optional
+
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from config.settings import DatadogConfig
+from src.models.incident import (
+    DatadogEvent,
+    LogEntry,
+    MetricDataPoint,
+    MetricSeries,
+    MonitorStatus,
+    ServiceDependency,
+    ServiceNode,
+    TraceSpan,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class DatadogClient:
+    """Async client for Datadog APIs with retry and circuit-breaking."""
+
+    def __init__(self, config: DatadogConfig) -> None:
+        self.config = config
+        self.base_url = f"https://api.{config.site}"
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            headers={
+                "DD-API-KEY": config.api_key,
+                "DD-APPLICATION-KEY": config.app_key,
+                "Content-Type": "application/json",
+            },
+            timeout=config.timeout_seconds,
+        )
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def __aenter__(self) -> DatadogClient:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.close()
+
+    # ── Metrics ──────────────────────────────────────────────────────
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def query_metrics(
+        self,
+        query: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[MetricSeries]:
+        """Query Datadog metrics API (timeseries)."""
+        resp = await self._client.get(
+            "/api/v1/query",
+            params={
+                "query": query,
+                "from": int(start.timestamp()),
+                "to": int(end.timestamp()),
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        results: list[MetricSeries] = []
+        for series in data.get("series", []):
+            points = [
+                MetricDataPoint(
+                    timestamp=datetime.fromtimestamp(pt[0] / 1000),
+                    value=pt[1] if pt[1] is not None else 0.0,
+                )
+                for pt in series.get("pointlist", [])
+            ]
+            results.append(
+                MetricSeries(
+                    metric_name=series.get("metric", query),
+                    display_name=series.get("display_name", series.get("expression", query)),
+                    points=points,
+                    unit=series.get("unit", [{}])[0].get("name", "") if series.get("unit") else "",
+                )
+            )
+        return results
+
+    async def fetch_service_metrics(
+        self,
+        service: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[MetricSeries]:
+        """Fetch standard service-level metrics (latency, errors, throughput)."""
+        queries = [
+            f"avg:trace.http.request.duration{{service:{service}}}",
+            f"sum:trace.http.request.errors{{service:{service}}}.as_count()",
+            f"sum:trace.http.request.hits{{service:{service}}}.as_count()",
+            f"avg:trace.http.request.duration.by.resource_name{{service:{service}}}",
+            f"max:system.cpu.user{{service:{service}}}",
+            f"avg:system.mem.used{{service:{service}}}",
+            f"avg:system.disk.in_use{{service:{service}}}",
+            f"avg:system.net.bytes_rcvd{{service:{service}}}",
+        ]
+        tasks = [self.query_metrics(q, start, end) for q in queries]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_series: list[MetricSeries] = []
+        for r in results:
+            if isinstance(r, list):
+                all_series.extend(r)
+            elif isinstance(r, Exception):
+                logger.warning("Metric query failed: %s", r)
+        return all_series
+
+    # ── Logs ─────────────────────────────────────────────────────────
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def search_logs(
+        self,
+        query: str,
+        start: datetime,
+        end: datetime,
+        limit: Optional[int] = None,
+    ) -> list[LogEntry]:
+        """Search logs using Datadog Log Search API v2."""
+        limit = limit or self.config.max_log_lines
+        body = {
+            "filter": {
+                "query": query,
+                "from": start.isoformat() + "Z",
+                "to": end.isoformat() + "Z",
+            },
+            "sort": "timestamp",
+            "page": {"limit": min(limit, 1000)},
+        }
+        resp = await self._client.post("/api/v2/logs/events/search", json=body)
+        resp.raise_for_status()
+        data = resp.json()
+
+        entries: list[LogEntry] = []
+        for log in data.get("data", []):
+            attrs = log.get("attributes", {})
+            entries.append(
+                LogEntry(
+                    timestamp=datetime.fromisoformat(
+                        attrs.get("timestamp", "").replace("Z", "+00:00")
+                    ),
+                    message=attrs.get("message", ""),
+                    service=attrs.get("service", ""),
+                    status=attrs.get("status", "info"),
+                    host=attrs.get("host", ""),
+                    attributes=attrs.get("attributes", {}),
+                    trace_id=attrs.get("attributes", {}).get("trace_id", ""),
+                )
+            )
+        return entries
+
+    async def fetch_service_logs(
+        self,
+        service: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[LogEntry]:
+        """Fetch error and warning logs for a service."""
+        queries = [
+            f"service:{service} status:error",
+            f"service:{service} status:warn",
+        ]
+        tasks = [self.search_logs(q, start, end, limit=500) for q in queries]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_logs: list[LogEntry] = []
+        for r in results:
+            if isinstance(r, list):
+                all_logs.extend(r)
+            elif isinstance(r, Exception):
+                logger.warning("Log search failed: %s", r)
+
+        all_logs.sort(key=lambda l: l.timestamp)
+        return all_logs
+
+    # ── Traces ───────────────────────────────────────────────────────
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def search_traces(
+        self,
+        query: str,
+        start: datetime,
+        end: datetime,
+        limit: Optional[int] = None,
+    ) -> list[TraceSpan]:
+        """Search APM traces using Datadog Trace Search API v2."""
+        limit = limit or self.config.max_trace_spans
+        body = {
+            "filter": {
+                "query": query,
+                "from": start.isoformat() + "Z",
+                "to": end.isoformat() + "Z",
+            },
+            "sort": "timestamp",
+            "page": {"limit": min(limit, 500)},
+        }
+        resp = await self._client.post("/api/v2/spans/events/search", json=body)
+        resp.raise_for_status()
+        data = resp.json()
+
+        spans: list[TraceSpan] = []
+        for item in data.get("data", []):
+            attrs = item.get("attributes", {})
+            spans.append(
+                TraceSpan(
+                    trace_id=attrs.get("trace_id", ""),
+                    span_id=attrs.get("span_id", ""),
+                    parent_id=attrs.get("parent_id", ""),
+                    service=attrs.get("service", ""),
+                    operation=attrs.get("operation_name", ""),
+                    resource=attrs.get("resource_name", ""),
+                    duration_ns=attrs.get("duration", 0),
+                    start_time=datetime.fromtimestamp(attrs.get("start", 0) / 1e9),
+                    status="error" if attrs.get("is_error") else "ok",
+                    error_message=attrs.get("meta", {}).get("error.message", ""),
+                    error_type=attrs.get("meta", {}).get("error.type", ""),
+                    meta=attrs.get("meta", {}),
+                )
+            )
+        return spans
+
+    async def fetch_service_traces(
+        self,
+        service: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[TraceSpan]:
+        """Fetch error traces and slow traces for a service."""
+        queries = [
+            f"service:{service} status:error",
+            f"service:{service} @duration:>1s",
+        ]
+        tasks = [self.search_traces(q, start, end, limit=250) for q in queries]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_spans: list[TraceSpan] = []
+        seen_ids: set[str] = set()
+        for r in results:
+            if isinstance(r, list):
+                for span in r:
+                    key = f"{span.trace_id}:{span.span_id}"
+                    if key not in seen_ids:
+                        seen_ids.add(key)
+                        all_spans.append(span)
+            elif isinstance(r, Exception):
+                logger.warning("Trace search failed: %s", r)
+        return all_spans
+
+    # ── Service Map / Dependencies ────────────────────────────────────
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def get_service_dependencies(
+        self,
+        service: str,
+        start: datetime,
+        end: datetime,
+    ) -> ServiceNode:
+        """Get service map/dependencies from Datadog APM."""
+        resp = await self._client.get(
+            "/api/v1/service_dependencies",
+            params={
+                "service": service,
+                "start": int(start.timestamp()),
+                "end": int(end.timestamp()),
+                "env": "production",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        deps = [
+            ServiceDependency(
+                source_service=service,
+                target_service=dep.get("name", ""),
+                call_type=dep.get("type", "http"),
+                avg_latency_ms=dep.get("avg_duration_ms", 0.0),
+                error_rate=dep.get("error_rate", 0.0),
+                calls_per_minute=dep.get("hits_per_minute", 0.0),
+            )
+            for dep in data.get("dependencies", [])
+        ]
+        dependents = [
+            ServiceDependency(
+                source_service=dep.get("name", ""),
+                target_service=service,
+                call_type=dep.get("type", "http"),
+                avg_latency_ms=dep.get("avg_duration_ms", 0.0),
+                error_rate=dep.get("error_rate", 0.0),
+                calls_per_minute=dep.get("hits_per_minute", 0.0),
+            )
+            for dep in data.get("dependents", [])
+        ]
+        return ServiceNode(
+            name=service,
+            service_type=data.get("type", ""),
+            dependencies=deps,
+            dependents=dependents,
+        )
+
+    # ── Events ───────────────────────────────────────────────────────
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def get_events(
+        self,
+        start: datetime,
+        end: datetime,
+        tags: Optional[list[str]] = None,
+        sources: Optional[list[str]] = None,
+    ) -> list[DatadogEvent]:
+        """Fetch events from the Datadog Event Stream."""
+        params: dict[str, Any] = {
+            "start": int(start.timestamp()),
+            "end": int(end.timestamp()),
+        }
+        if tags:
+            params["tags"] = ",".join(tags)
+        if sources:
+            params["sources"] = ",".join(sources)
+
+        resp = await self._client.get("/api/v1/events", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+        return [
+            DatadogEvent(
+                timestamp=datetime.fromtimestamp(evt.get("date_happened", 0)),
+                title=evt.get("title", ""),
+                text=evt.get("text", ""),
+                source=evt.get("source", ""),
+                tags=evt.get("tags", []),
+                alert_type=evt.get("alert_type", ""),
+            )
+            for evt in data.get("events", [])
+        ]
+
+    async def get_deployment_events(
+        self,
+        service: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[DatadogEvent]:
+        """Fetch deployment-specific events."""
+        return await self.get_events(
+            start=start,
+            end=end,
+            tags=[f"service:{service}"],
+            sources=["deploy", "jenkins", "github", "argocd", "spinnaker"],
+        )
+
+    # ── Monitors ─────────────────────────────────────────────────────
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def get_monitor(self, monitor_id: int) -> dict:
+        """Fetch a single monitor definition by ID."""
+        resp = await self._client.get(f"/api/v1/monitor/{monitor_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def fetch_infra_metrics(
+        self,
+        tags: dict[str, str],
+        start: datetime,
+        end: datetime,
+    ) -> list[MetricSeries]:
+        """Fetch K8s infrastructure metrics (CPU, memory, restarts, throttling) for given tags."""
+        tag_filter = ",".join(f"{k}:{v}" for k, v in tags.items())
+        queries = [
+            f"avg:kubernetes.cpu.usage.total{{{tag_filter}}}",
+            f"avg:kubernetes.memory.usage{{{tag_filter}}}",
+            f"sum:kubernetes.containers.restarts{{{tag_filter}}}.as_count()",
+            f"avg:kubernetes.cpu.limits{{{tag_filter}}}",
+            f"avg:kubernetes.cpu.requests{{{tag_filter}}}",
+            f"avg:kubernetes.memory.limits{{{tag_filter}}}",
+            f"avg:container.cpu.throttled{{{tag_filter}}}",
+        ]
+        tasks = [self.query_metrics(q, start, end) for q in queries]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_series: list[MetricSeries] = []
+        for r in results:
+            if isinstance(r, list):
+                all_series.extend(r)
+            elif isinstance(r, Exception):
+                logger.warning("Infra metric query failed: %s", r)
+        return all_series
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def get_triggered_monitors(
+        self,
+        service: str,
+    ) -> list[MonitorStatus]:
+        """Get monitors currently in alert/warn state for a service."""
+        resp = await self._client.get(
+            "/api/v1/monitor",
+            params={
+                "monitor_tags": f"service:{service}",
+                "group_states": "alert,warn",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        return [
+            MonitorStatus(
+                monitor_id=mon.get("id", 0),
+                name=mon.get("name", ""),
+                status=mon.get("overall_state", ""),
+                message=mon.get("message", ""),
+                tags=mon.get("tags", []),
+            )
+            for mon in data
+            if isinstance(data, list)
+        ]
