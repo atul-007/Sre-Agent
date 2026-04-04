@@ -11,6 +11,7 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config.settings import DatadogConfig
+from src.utils.time import ensure_utc, safe_fromisoformat, safe_timestamp
 from src.models.incident import (
     DatadogEvent,
     LogEntry,
@@ -281,7 +282,7 @@ class DatadogClient:
         for series in data.get("series", []):
             points = [
                 MetricDataPoint(
-                    timestamp=datetime.fromtimestamp(pt[0] / 1000),
+                    timestamp=safe_timestamp(pt[0] / 1000),
                     value=pt[1] if pt[1] is not None else 0.0,
                 )
                 for pt in series.get("pointlist", [])
@@ -360,9 +361,7 @@ class DatadogClient:
             attrs = log.get("attributes", {})
             entries.append(
                 LogEntry(
-                    timestamp=datetime.fromisoformat(
-                        attrs.get("timestamp", "").replace("Z", "+00:00")
-                    ),
+                    timestamp=safe_fromisoformat(attrs.get("timestamp", "")),
                     message=attrs.get("message", ""),
                     service=attrs.get("service", ""),
                     status=attrs.get("status", "info"),
@@ -464,7 +463,7 @@ class DatadogClient:
                     operation=attrs.get("operation_name", ""),
                     resource=attrs.get("resource_name", ""),
                     duration_ns=attrs.get("duration", 0),
-                    start_time=datetime.fromtimestamp(attrs.get("start", 0) / 1e9),
+                    start_time=safe_timestamp(attrs.get("start", 0) / 1e9),
                     status="error" if attrs.get("is_error") else "ok",
                     error_message=attrs.get("meta", {}).get("error.message", ""),
                     error_type=attrs.get("meta", {}).get("error.type", ""),
@@ -577,7 +576,7 @@ class DatadogClient:
 
         return [
             DatadogEvent(
-                timestamp=datetime.fromtimestamp(evt.get("date_happened", 0)),
+                timestamp=safe_timestamp(evt.get("date_happened", 0)),
                 title=evt.get("title", ""),
                 text=evt.get("text", ""),
                 source=evt.get("source", ""),

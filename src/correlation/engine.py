@@ -7,6 +7,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from statistics import mean, stdev
 
+from src.utils.time import ensure_utc
 from src.models.incident import (
     IncidentQuery,
     IncidentSeverity,
@@ -85,6 +86,9 @@ class CorrelationEngine:
                 )
             )
 
+        # Normalize all timestamps to UTC to prevent naive/aware comparison errors
+        for evt in events:
+            evt.timestamp = ensure_utc(evt.timestamp)
         events.sort(key=lambda e: e.timestamp)
         return events
 

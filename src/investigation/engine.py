@@ -726,10 +726,7 @@ class InvestigationEngine:
             return data, summary
 
         elif action_type == InvestigationActionType.CORRELATE_SIGNALS:
-            try:
-                timeline = self.correlation.build_timeline(incident, accumulated_data)
-            except TypeError:
-                timeline = []
+            timeline = self.correlation.build_timeline(incident, accumulated_data)
             service_corr = self.correlation.correlate_services(accumulated_data)
             anomaly_summary = self.correlation.compute_anomaly_summary(accumulated_data)
             data = {
@@ -925,9 +922,29 @@ class InvestigationEngine:
                 if not isinstance(update, dict):
                     continue
                 h_id = update.get("id", "")
-                if h_id == "new" or h_id not in self.state.hypotheses:
-                    # Create new hypothesis
-                    new_id = h_id if h_id != "new" else f"h{len(self.state.hypotheses) + 1}"
+                description = update.get("description", "")
+
+                # Match by ID first, then by description similarity
+                matched_id = self._find_matching_hypothesis(h_id, description)
+
+                if matched_id:
+                    # Update existing hypothesis
+                    h = self.state.hypotheses[matched_id]
+                    status_str = update.get("status", h.status.value)
+                    try:
+                        h.status = HypothesisStatus(status_str)
+                    except ValueError:
+                        pass
+                    if "confidence" in update:
+                        h.confidence = min(max(float(update["confidence"]), 0.0), 1.0)
+                    if description and len(description) > len(h.description):
+                        h.description = description
+                    h.supporting_evidence.extend(update.get("supporting_evidence", []))
+                    h.contradicting_evidence.extend(update.get("contradicting_evidence", []))
+                    h.last_updated_step = step_number
+                else:
+                    # Create new hypothesis with unique ID
+                    new_id = self._next_hypothesis_id()
                     status_str = update.get("status", "pending")
                     try:
                         status = HypothesisStatus(status_str)
@@ -936,7 +953,7 @@ class InvestigationEngine:
 
                     self.state.hypotheses[new_id] = TrackedHypothesis(
                         id=new_id,
-                        description=update.get("description", ""),
+                        description=description,
                         status=status,
                         confidence=min(max(float(update.get("confidence", 0.0)), 0.0), 1.0),
                         supporting_evidence=update.get("supporting_evidence", []),
@@ -944,18 +961,6 @@ class InvestigationEngine:
                         created_at_step=step_number,
                         last_updated_step=step_number,
                     )
-                else:
-                    # Update existing hypothesis
-                    h = self.state.hypotheses[h_id]
-                    status_str = update.get("status", h.status.value)
-                    try:
-                        h.status = HypothesisStatus(status_str)
-                    except ValueError:
-                        pass
-                    if "confidence" in update:
-                        h.confidence = min(max(float(update["confidence"]), 0.0), 1.0)
-                    h.supporting_evidence.extend(update.get("supporting_evidence", []))
-                    h.contradicting_evidence.extend(update.get("contradicting_evidence", []))
                     h.last_updated_step = step_number
             return
 
@@ -965,7 +970,6 @@ class InvestigationEngine:
             for i, hyp_str in enumerate(old_hyps):
                 if not isinstance(hyp_str, str):
                     continue
-                h_id = f"h{i + 1}"
                 # Try to detect status from text
                 status = HypothesisStatus.PENDING
                 lower = hyp_str.lower()
@@ -978,18 +982,77 @@ class InvestigationEngine:
                 elif "inconclusive" in lower:
                     status = HypothesisStatus.INCONCLUSIVE
 
-                if h_id in self.state.hypotheses:
-                    self.state.hypotheses[h_id].status = status
-                    self.state.hypotheses[h_id].description = hyp_str[:200]
-                    self.state.hypotheses[h_id].last_updated_step = step_number
+                # Use description matching instead of positional ID
+                matched_id = self._find_matching_hypothesis("", hyp_str[:200])
+                if matched_id:
+                    self.state.hypotheses[matched_id].status = status
+                    self.state.hypotheses[matched_id].description = hyp_str[:200]
+                    self.state.hypotheses[matched_id].last_updated_step = step_number
                 else:
-                    self.state.hypotheses[h_id] = TrackedHypothesis(
-                        id=h_id,
+                    new_id = self._next_hypothesis_id()
+                    self.state.hypotheses[new_id] = TrackedHypothesis(
+                        id=new_id,
                         description=hyp_str[:200],
                         status=status,
                         created_at_step=step_number,
                         last_updated_step=step_number,
                     )
+
+    def _find_matching_hypothesis(self, h_id: str, description: str) -> str | None:
+        """Find an existing hypothesis matching by ID or description similarity.
+
+        Returns the ID of the matched hypothesis, or None if no match found.
+        """
+        if not self.state:
+            return None
+
+        # Exact ID match
+        if h_id and h_id != "new" and h_id in self.state.hypotheses:
+            return h_id
+
+        # Description similarity match — check if descriptions share significant keywords
+        if description:
+            desc_lower = description.lower()
+            desc_words = set(desc_lower.split())
+            # Remove common words
+            stop_words = {"the", "a", "an", "is", "are", "was", "were", "be", "been",
+                          "in", "on", "at", "to", "for", "of", "with", "by", "from",
+                          "may", "might", "could", "would", "should", "can", "will",
+                          "this", "that", "these", "those", "it", "its", "and", "or"}
+            desc_keywords = desc_words - stop_words
+
+            best_match = None
+            best_overlap = 0
+
+            for existing_id, existing in self.state.hypotheses.items():
+                existing_lower = existing.description.lower()
+                existing_words = set(existing_lower.split()) - stop_words
+
+                if not existing_words or not desc_keywords:
+                    continue
+
+                # Calculate Jaccard-like overlap
+                overlap = len(desc_keywords & existing_words)
+                min_size = min(len(desc_keywords), len(existing_words))
+                if min_size > 0 and overlap / min_size > 0.5 and overlap > best_overlap:
+                    best_match = existing_id
+                    best_overlap = overlap
+
+            if best_match:
+                return best_match
+
+        return None
+
+    def _next_hypothesis_id(self) -> str:
+        """Generate a unique hypothesis ID."""
+        if not self.state:
+            return "h1"
+        # Find the max numeric suffix and increment
+        max_num = 0
+        for h_id in self.state.hypotheses:
+            if h_id.startswith("h") and h_id[1:].isdigit():
+                max_num = max(max_num, int(h_id[1:]))
+        return f"h{max_num + 1}"
 
     # ── Report Generation ─────────────────────────────────────────────
 
@@ -1073,12 +1136,8 @@ class InvestigationEngine:
                     confidence=0.3,
                 ))
 
-        # Build timeline from correlation (handle tz-aware/naive mismatch)
-        try:
-            timeline = self.correlation.build_timeline(incident, accumulated_data)
-        except TypeError:
-            logger.warning("Timeline build failed (datetime tz mismatch), skipping")
-            timeline = []
+        # Build timeline from correlation
+        timeline = self.correlation.build_timeline(incident, accumulated_data)
 
         return RCAReport(
             incident=incident,
