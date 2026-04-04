@@ -172,6 +172,16 @@ class TrackedHypothesis(BaseModel):
     parent_hypothesis_id: Optional[str] = None
 
 
+class DataGap(BaseModel):
+    """A signal the investigation could not obtain data for."""
+
+    signal: str
+    queries_attempted: list[str] = Field(default_factory=list)
+    failure_reason: str = ""
+    recommendation: str = ""
+    impact: str = ""
+
+
 class SignalCheckResult(BaseModel):
     """Result of checking a required signal during investigation."""
 
@@ -179,6 +189,10 @@ class SignalCheckResult(BaseModel):
     checked: bool = False
     step_number: int = 0
     data_found: bool = False
+    data_quality: float = 0.0  # 0.0=empty, 0.5=partial, 1.0=complete
+    diagnostic_value: float = 0.0  # did this data help narrow hypotheses?
+    queries_attempted: list[str] = Field(default_factory=list)
+    retry_count: int = 0
     notes: str = ""
 
 
@@ -211,6 +225,12 @@ class InvestigationState(BaseModel):
     total_fetches: int = 0
     data_gap_log: list[str] = Field(default_factory=list)
     discovered_context: Optional[DiscoveredContext] = None
+    # v3 additions
+    data_gaps: list[DataGap] = Field(default_factory=list)
+    depth_steps_taken: int = 0
+    investigation_start_time: Optional[datetime] = None
+    phase: str = "discovery"  # discovery|breadth|depth|concluding
+    changes_detected: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class InvestigationActionType(str, Enum):
@@ -277,3 +297,8 @@ class RCAReport(BaseModel):
     evidence_chain: list[str] = Field(default_factory=list)
     raw_reasoning: str = ""
     investigation_trace: Optional[InvestigationTrace] = None
+    # v3 additions
+    data_gaps: list[DataGap] = Field(default_factory=list)
+    signal_quality_summary: dict[str, Any] = Field(default_factory=dict)
+    report_type: str = "rca"  # "rca" or "investigation_summary"
+    recommended_next_steps: list[str] = Field(default_factory=list)

@@ -13,7 +13,8 @@ from src.models.incident import (
     InvestigationState,
     SymptomType,
 )
-from src.investigation.engine import InvestigationEngine
+from src.investigation.discovery import DiscoveryPhase
+from src.investigation.analysis import AnalysisPhase
 from src.models.incident import TrackedHypothesis, HypothesisStatus
 
 
@@ -161,7 +162,7 @@ class TestExtractMetricsFromDashboard:
 
 class TestNamespaceCandidateGeneration:
     def test_basic_generation(self):
-        candidates = InvestigationEngine._generate_namespace_candidates(
+        candidates = DiscoveryPhase.generate_namespace_candidates(
             "production", "mk-sp-event-log-router", {}
         )
         assert "mk-sp-event-log-router" in candidates
@@ -169,13 +170,13 @@ class TestNamespaceCandidateGeneration:
         assert any("mk-sp-prod" in c or "mk-sp-production" in c for c in candidates)
 
     def test_respects_source_tags(self):
-        candidates = InvestigationEngine._generate_namespace_candidates(
+        candidates = DiscoveryPhase.generate_namespace_candidates(
             "production", "my-svc", {"kube_namespace": "exact-ns"}
         )
         assert candidates[0] == "exact-ns"
 
     def test_namespace_hint_with_suffixes(self):
-        candidates = InvestigationEngine._generate_namespace_candidates(
+        candidates = DiscoveryPhase.generate_namespace_candidates(
             "production", "my-svc", {"namespace": "mercari-search-platform"}
         )
         assert "mercari-search-platform-prod" in candidates
@@ -183,13 +184,13 @@ class TestNamespaceCandidateGeneration:
         assert "mercari-search-platform" in candidates
 
     def test_deduplicates(self):
-        candidates = InvestigationEngine._generate_namespace_candidates(
+        candidates = DiscoveryPhase.generate_namespace_candidates(
             "production", "a-b-c", {}
         )
         assert len(candidates) == len(set(candidates))
 
     def test_staging_suffixes(self):
-        candidates = InvestigationEngine._generate_namespace_candidates(
+        candidates = DiscoveryPhase.generate_namespace_candidates(
             "staging", "my-svc", {"namespace": "my-ns"}
         )
         assert "my-ns-staging" in candidates
@@ -200,54 +201,41 @@ class TestNamespaceCandidateGeneration:
 
 
 class TestBuildQueriesFromDiscovered:
-    def _make_engine(self):
-        config = AgentConfig()
-        dd = MagicMock()
-        reasoning = MagicMock()
-        correlation = MagicMock()
-        return InvestigationEngine(dd, reasoning, correlation, config)
-
     def test_prioritizes_dashboard_metrics(self):
-        engine = self._make_engine()
         ctx = DiscoveredContext(
             dashboard_metrics=["flink.task.numRecordsIn", "flink.jvm.cpu.load"],
             resolved_tags={"kube_namespace": "my-ns"},
         )
-        queries = engine._build_queries_from_discovered(ctx, "my-svc")
-        # Dashboard metrics should be first
+        queries = DiscoveryPhase.build_queries_from_discovered(ctx, "my-svc")
         assert any("flink.task.numRecordsIn" in q for q in queries)
         assert any("kube_namespace:my-ns" in q for q in queries)
 
     def test_uses_service_tag_when_no_resolved(self):
-        engine = self._make_engine()
         ctx = DiscoveredContext(
             dashboard_metrics=["some.metric"],
         )
-        queries = engine._build_queries_from_discovered(ctx, "my-svc")
+        queries = DiscoveryPhase.build_queries_from_discovered(ctx, "my-svc")
         assert any("service:my-svc" in q for q in queries)
 
     def test_includes_container_metrics(self):
-        engine = self._make_engine()
         ctx = DiscoveredContext(
             container_metrics=["container.cpu.usage", "container.memory.usage"],
             resolved_tags={"kube_namespace": "ns"},
         )
-        queries = engine._build_queries_from_discovered(ctx, "svc")
+        queries = DiscoveryPhase.build_queries_from_discovered(ctx, "svc")
         assert any("container.cpu" in q for q in queries)
 
     def test_includes_custom_metrics(self):
-        engine = self._make_engine()
         ctx = DiscoveredContext(
             custom_metrics=["my_app.queue_depth", "my_app.processing_time"],
             resolved_tags={},
         )
-        queries = engine._build_queries_from_discovered(ctx, "svc")
+        queries = DiscoveryPhase.build_queries_from_discovered(ctx, "svc")
         assert any("my_app.queue_depth" in q for q in queries)
 
     def test_empty_context_returns_empty(self):
-        engine = self._make_engine()
         ctx = DiscoveredContext()
-        queries = engine._build_queries_from_discovered(ctx, "svc")
+        queries = DiscoveryPhase.build_queries_from_discovered(ctx, "svc")
         assert queries == []
 
 
@@ -267,14 +255,11 @@ class TestDiscoverContextActionType:
 
 
 class TestDiscoverServiceContextIntegration:
-    def _make_engine(self):
+    def _make_discovery(self):
         config = AgentConfig()
         dd = AsyncMock(spec=DatadogClient)
-        reasoning = MagicMock()
-        correlation = MagicMock()
-        engine = InvestigationEngine(dd, reasoning, correlation, config)
-        engine.state = InvestigationState()
-        return engine, dd
+        discovery = DiscoveryPhase(dd, config)
+        return discovery, dd
 
     def _make_incident(self):
         now = datetime.now(timezone.utc)
@@ -290,7 +275,7 @@ class TestDiscoverServiceContextIntegration:
 
     @pytest.mark.asyncio
     async def test_discovers_metrics(self):
-        engine, dd = self._make_engine()
+        discovery, dd = self._make_discovery()
         incident = self._make_incident()
 
         # Mock metric search returning results
@@ -305,7 +290,7 @@ class TestDiscoverServiceContextIntegration:
         dd.search_hosts_by_tag = AsyncMock(return_value=[])
         dd.search_monitors = AsyncMock(return_value=[])
 
-        ctx = await engine._discover_service_context(incident)
+        ctx = await discovery.discover(incident)
 
         assert len(ctx.available_metrics) == 3
         assert "container.cpu.usage" in ctx.container_metrics
@@ -313,7 +298,7 @@ class TestDiscoverServiceContextIntegration:
 
     @pytest.mark.asyncio
     async def test_resolves_namespace_with_suffix(self):
-        engine, dd = self._make_engine()
+        discovery, dd = self._make_discovery()
         incident = self._make_incident()
 
         dd.search_metrics = AsyncMock(return_value=[])
@@ -339,13 +324,13 @@ class TestDiscoverServiceContextIntegration:
 
         dd.query_metrics = mock_query_metrics
 
-        ctx = await engine._discover_service_context(incident)
+        ctx = await discovery.discover(incident)
         assert ctx.resolved_namespace == "mercari-search-platform-prod"
         assert ctx.resolved_tags.get("kube_namespace") == "mercari-search-platform-prod"
 
     @pytest.mark.asyncio
     async def test_mines_dashboards(self):
-        engine, dd = self._make_engine()
+        discovery, dd = self._make_discovery()
         incident = self._make_incident()
 
         dd.search_metrics = AsyncMock(return_value=[])
@@ -372,14 +357,14 @@ class TestDiscoverServiceContextIntegration:
             }
         ])
 
-        ctx = await engine._discover_service_context(incident)
+        ctx = await discovery.discover(incident)
         assert "flink.task.numRecordsIn" in ctx.dashboard_metrics
         assert "flink.task.numRecordsOut" in ctx.dashboard_metrics
         assert "dash-1" in ctx.dashboard_ids
 
     @pytest.mark.asyncio
     async def test_falls_back_to_host_tags(self):
-        engine, dd = self._make_engine()
+        discovery, dd = self._make_discovery()
         incident = self._make_incident()
 
         dd.search_metrics = AsyncMock(return_value=[])
@@ -401,13 +386,13 @@ class TestDiscoverServiceContextIntegration:
             }
         ])
 
-        ctx = await engine._discover_service_context(incident)
+        ctx = await discovery.discover(incident)
         assert ctx.resolved_tags.get("kube_namespace") == "mercari-search-platform-prod"
         assert ctx.resolved_tags.get("env") == "production"
 
     @pytest.mark.asyncio
     async def test_handles_all_failures_gracefully(self):
-        engine, dd = self._make_engine()
+        discovery, dd = self._make_discovery()
         incident = self._make_incident()
 
         # Everything fails
@@ -418,7 +403,7 @@ class TestDiscoverServiceContextIntegration:
 
         dd.search_monitors = AsyncMock(side_effect=Exception("API error"))
 
-        ctx = await engine._discover_service_context(incident)
+        ctx = await discovery.discover(incident)
         # Should return empty context, not crash
         assert ctx.available_metrics == []
         assert ctx.resolved_namespace == ""
@@ -428,49 +413,42 @@ class TestDiscoverServiceContextIntegration:
 
 
 class TestHypothesisMatching:
-    def _make_engine(self):
-        config = AgentConfig()
-        dd = MagicMock()
-        reasoning = MagicMock()
-        correlation = MagicMock()
-        engine = InvestigationEngine(dd, reasoning, correlation, config)
-        engine.state = InvestigationState()
-        return engine
+    def _make_state(self):
+        return InvestigationState()
 
     def test_exact_id_match(self):
-        engine = self._make_engine()
-        engine.state.hypotheses["h1"] = TrackedHypothesis(
+        state = self._make_state()
+        state.hypotheses["h1"] = TrackedHypothesis(
             id="h1", description="CPU saturation due to high request rate"
         )
-        result = engine._find_matching_hypothesis("h1", "whatever")
+        result = AnalysisPhase._find_matching_hypothesis("h1", "whatever", state)
         assert result == "h1"
 
     def test_description_similarity_match(self):
-        engine = self._make_engine()
-        engine.state.hypotheses["h1"] = TrackedHypothesis(
+        state = self._make_state()
+        state.hypotheses["h1"] = TrackedHypothesis(
             id="h1", description="CPU saturation caused by high request rate"
         )
-        # Similar description, different ID
-        result = engine._find_matching_hypothesis("h99", "CPU saturation from high request rate")
+        result = AnalysisPhase._find_matching_hypothesis("h99", "CPU saturation from high request rate", state)
         assert result == "h1"
 
     def test_no_match_for_different_hypothesis(self):
-        engine = self._make_engine()
-        engine.state.hypotheses["h1"] = TrackedHypothesis(
+        state = self._make_state()
+        state.hypotheses["h1"] = TrackedHypothesis(
             id="h1", description="CPU saturation caused by high request rate"
         )
-        result = engine._find_matching_hypothesis("h99", "Memory leak in connection pool")
+        result = AnalysisPhase._find_matching_hypothesis("h99", "Memory leak in connection pool", state)
         assert result is None
 
     def test_next_hypothesis_id(self):
-        engine = self._make_engine()
-        assert engine._next_hypothesis_id() == "h1"
+        state = self._make_state()
+        assert AnalysisPhase._next_hypothesis_id(state) == "h1"
 
-        engine.state.hypotheses["h1"] = TrackedHypothesis(id="h1", description="test")
-        assert engine._next_hypothesis_id() == "h2"
+        state.hypotheses["h1"] = TrackedHypothesis(id="h1", description="test")
+        assert AnalysisPhase._next_hypothesis_id(state) == "h2"
 
-        engine.state.hypotheses["h5"] = TrackedHypothesis(id="h5", description="test")
-        assert engine._next_hypothesis_id() == "h6"
+        state.hypotheses["h5"] = TrackedHypothesis(id="h5", description="test")
+        assert AnalysisPhase._next_hypothesis_id(state) == "h6"
 
 
 # ── Monitor Metric Extraction Tests ──────────────────────────────────
