@@ -340,3 +340,34 @@ Structure your response as JSON:
     ],
     "evidence_chain": ["<evidence item 1>", "<evidence item 2>"]
 }}"""
+
+
+DEPTH_ANALYSIS_PROMPT = """You are investigating a SPECIFIC hypothesis in depth.
+This is a targeted deep-dive — not a broad scan. Focus only on what this data reveals about this hypothesis.
+
+**Hypothesis:** {hypothesis_description}
+**Current confidence:** {confidence:.0%}
+**Category:** {category}
+
+**New data from targeted query ({query_description}):**
+{data_content}
+
+**Previous evidence for this hypothesis:**
+Supporting: {supporting_evidence}
+Contradicting: {contradicting_evidence}
+
+Based on this new data:
+1. Does it SUPPORT or CONTRADICT the hypothesis? Why specifically?
+2. Can you now identify the SPECIFIC MECHANISM (not just the symptom)?
+   - "Pod X is hot" is a SYMPTOM. "Pod X has a GC storm because heap is at 98% capacity" is a MECHANISM.
+   - "Load is uneven" is a SYMPTOM. "Sticky sessions with consistent hashing route 40% of traffic to one pod" is a MECHANISM.
+3. What confidence adjustment is warranted?
+
+Respond in JSON:
+{{
+    "supports": true,
+    "mechanism": "<specific mechanism identified, or empty string if none>",
+    "evidence_summary": "<what exactly does this data show>",
+    "confidence_delta": 0.0,
+    "next_query_suggestion": "<what one query would most help narrow down the mechanism>"
+}}"""
