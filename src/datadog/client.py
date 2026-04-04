@@ -343,11 +343,14 @@ class DatadogClient:
     ) -> list[LogEntry]:
         """Search logs using Datadog Log Search API v2."""
         limit = limit or self.config.max_log_lines
+        # Ensure timestamps are UTC and format correctly for Datadog API
+        start_utc = ensure_utc(start)
+        end_utc = ensure_utc(end)
         body = {
             "filter": {
                 "query": query,
-                "from": start.isoformat() + "Z",
-                "to": end.isoformat() + "Z",
+                "from": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "to": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             },
             "sort": "timestamp",
             "page": {"limit": min(limit, 1000)},
@@ -438,11 +441,13 @@ class DatadogClient:
     ) -> list[TraceSpan]:
         """Search APM traces using Datadog Trace Search API v2."""
         limit = limit or self.config.max_trace_spans
+        start_utc = ensure_utc(start)
+        end_utc = ensure_utc(end)
         body = {
             "filter": {
                 "query": query,
-                "from": start.isoformat() + "Z",
-                "to": end.isoformat() + "Z",
+                "from": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "to": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             },
             "sort": "timestamp",
             "page": {"limit": min(limit, 500)},
