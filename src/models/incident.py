@@ -182,6 +182,25 @@ class SignalCheckResult(BaseModel):
     notes: str = ""
 
 
+class DiscoveredContext(BaseModel):
+    """Service context discovered before investigation starts (step 0).
+
+    Contains actual metrics, tags, and namespace values found via Datadog APIs,
+    replacing hardcoded assumptions about what metrics exist.
+    """
+
+    available_metrics: list[str] = Field(default_factory=list)
+    metric_tags: dict[str, list[str]] = Field(default_factory=dict)
+    resolved_namespace: str = ""
+    resolved_tags: dict[str, str] = Field(default_factory=dict)
+    dashboard_metrics: list[str] = Field(default_factory=list)
+    dashboard_ids: list[str] = Field(default_factory=list)
+    infra_metrics: list[str] = Field(default_factory=list)
+    container_metrics: list[str] = Field(default_factory=list)
+    apm_metrics: list[str] = Field(default_factory=list)
+    custom_metrics: list[str] = Field(default_factory=list)
+
+
 class InvestigationState(BaseModel):
     """Cross-step investigation state — hypothesis tree + signal coverage."""
 
@@ -190,6 +209,7 @@ class InvestigationState(BaseModel):
     empty_fetches: int = 0
     total_fetches: int = 0
     data_gap_log: list[str] = Field(default_factory=list)
+    discovered_context: Optional[DiscoveredContext] = None
 
 
 class InvestigationActionType(str, Enum):
@@ -209,6 +229,7 @@ class InvestigationActionType(str, Enum):
     CORRELATE_SIGNALS = "correlate_signals"
     ANALYZE_HYPOTHESIS = "analyze_hypothesis"
     EXPAND_SCOPE = "expand_scope"
+    DISCOVER_CONTEXT = "discover_context"
     CONCLUDE = "conclude"
 
 

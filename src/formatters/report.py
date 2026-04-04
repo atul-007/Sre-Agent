@@ -375,5 +375,6 @@ def _action_emoji(action: str) -> str:
         "expand_scope": ":telescope:",
         "analyze_hypothesis": ":brain:",
         "conclude": ":white_check_mark:",
+        "discover_context": ":compass:",
     }
     return mapping.get(action, ":mag:")

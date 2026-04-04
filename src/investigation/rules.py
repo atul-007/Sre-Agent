@@ -163,6 +163,7 @@ ACTION_TO_SIGNALS: dict[str, list[str]] = {
     InvestigationActionType.EXPAND_SCOPE.value: ["dependencies"],
     InvestigationActionType.ANALYZE_HYPOTHESIS.value: [],
     InvestigationActionType.CONCLUDE.value: [],
+    InvestigationActionType.DISCOVER_CONTEXT.value: [],
 }
 
 # ── Tag fallback patterns ─────────────────────────────────────────────

@@ -219,8 +219,15 @@ INVESTIGATION_PLANNING_PROMPT = """You are investigating a production incident s
 **Signal coverage (required signals for this alert type):**
 {signal_coverage}
 
-IMPORTANT: Prioritize filling gaps in signal coverage. If signals are marked "NOT YET CHECKED",
-investigate those BEFORE concluding. Do NOT conclude until critical signals are checked.
+**Discovered service context (from API discovery):**
+{discovered_context}
+
+IMPORTANT:
+- Use DISCOVERED metrics and tags when forming queries — do NOT guess metric names.
+- If a resolved namespace was found, use it in tag filters (e.g., kube_namespace:<resolved>).
+- If dashboard metrics were found, prioritize querying those — the team already monitors them.
+- Prioritize filling gaps in signal coverage. If signals are marked "NOT YET CHECKED",
+  investigate those BEFORE concluding. Do NOT conclude until critical signals are checked.
 
 Decide what to investigate NEXT. Choose ONE action:
 - fetch_metrics: Fetch standard service metrics (latency, errors, throughput, CPU, memory, disk, network)

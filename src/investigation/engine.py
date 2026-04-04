@@ -33,6 +33,7 @@ from src.investigation.rules import (
     mark_signals_checked,
 )
 from src.models.incident import (
+    DiscoveredContext,
     Hypothesis,
     HypothesisStatus,
     IncidentQuery,
@@ -97,6 +98,57 @@ class InvestigationEngine:
         )
 
         async with self.dd_client:
+            # Step 0: Discover service context before investigating
+            try:
+                discovered = await self._discover_service_context(incident)
+                self.state.discovered_context = discovered
+
+                # Update incident source_tags with resolved tags
+                if discovered.resolved_tags:
+                    for k, v in discovered.resolved_tags.items():
+                        if k not in incident.source_tags:
+                            incident.source_tags[k] = v
+
+                # Log discovery as step 0
+                discovery_summary_parts = []
+                if discovered.available_metrics:
+                    discovery_summary_parts.append(
+                        f"{len(discovered.available_metrics)} metrics"
+                    )
+                if discovered.resolved_namespace:
+                    discovery_summary_parts.append(
+                        f"namespace={discovered.resolved_namespace}"
+                    )
+                if discovered.dashboard_metrics:
+                    discovery_summary_parts.append(
+                        f"{len(discovered.dashboard_metrics)} dashboard metrics"
+                    )
+                if discovered.resolved_tags:
+                    discovery_summary_parts.append(
+                        f"tags={discovered.resolved_tags}"
+                    )
+
+                discovery_step = InvestigationStep(
+                    step_number=0,
+                    action=InvestigationActionType.DISCOVER_CONTEXT,
+                    reason="Discover available metrics, tags, and dashboards before investigating",
+                    data_source=incident.service,
+                    findings=f"Discovered: {', '.join(discovery_summary_parts) or 'no context found'}",
+                    data_summary=f"Discovery: {len(discovered.available_metrics)} metrics, "
+                                 f"namespace={discovered.resolved_namespace or 'unresolved'}, "
+                                 f"{len(discovered.dashboard_metrics)} dashboard metrics",
+                    confidence=0.0,
+                )
+                trace.steps.append(discovery_step)
+
+                if self.on_step_complete:
+                    try:
+                        await self.on_step_complete(discovery_step)
+                    except Exception as e:
+                        logger.warning("Step 0 callback failed: %s", e)
+
+            except Exception as e:
+                logger.warning("Service discovery failed (non-fatal): %s", e)
             while not trace.concluded and trace.total_steps < self.max_steps:
                 step_start = time.monotonic()
                 step_number = trace.total_steps + 1
@@ -264,6 +316,220 @@ class InvestigationEngine:
 
         return await self._generate_final_report(incident, trace, accumulated_data)
 
+    # ── Service Discovery (Step 0) ─────────────────────────────────────
+
+    async def _discover_service_context(self, incident: IncidentQuery) -> DiscoveredContext:
+        """Discover what metrics, tags, and dashboards exist for the service.
+
+        This runs as step 0 before any investigation, replacing the blind
+        guessing approach with actual API lookups. A senior SRE would do this
+        manually (check what metrics exist, find the right namespace, look at
+        existing dashboards) — this automates that process.
+        """
+        ctx = DiscoveredContext()
+        service = incident.service
+
+        logger.info("Step 0: Discovering service context for %s", service)
+
+        # 1. Search for metrics matching the service name
+        search_terms = [service]
+        # Also try parts of the service name (e.g., event-log-router from mk-sp-event-log-router)
+        parts = service.split("-")
+        if len(parts) > 2:
+            search_terms.append("-".join(parts[-3:]))
+            search_terms.append("-".join(parts[-2:]))
+        # Try without prefix (e.g., sp-event-log-router)
+        if len(parts) > 1:
+            search_terms.append("-".join(parts[1:]))
+
+        all_found_metrics: set[str] = set()
+        for term in search_terms:
+            try:
+                metrics = await self.dd_client.search_metrics(term)
+                all_found_metrics.update(metrics)
+                if metrics:
+                    logger.info("  Metric search '%s': found %d metrics", term, len(metrics))
+            except Exception as e:
+                logger.warning("  Metric search '%s' failed: %s", term, e)
+
+        # 2. Categorize discovered metrics
+        for m in all_found_metrics:
+            m_lower = m.lower()
+            if any(k in m_lower for k in ("container.", "docker.")):
+                ctx.container_metrics.append(m)
+            elif any(k in m_lower for k in ("kubernetes.", "kube_")):
+                ctx.infra_metrics.append(m)
+            elif any(k in m_lower for k in ("trace.", "apm.")):
+                ctx.apm_metrics.append(m)
+            else:
+                ctx.custom_metrics.append(m)
+
+        ctx.available_metrics = sorted(all_found_metrics)
+        logger.info(
+            "  Discovered %d metrics: %d container, %d k8s, %d APM, %d custom",
+            len(ctx.available_metrics),
+            len(ctx.container_metrics),
+            len(ctx.infra_metrics),
+            len(ctx.apm_metrics),
+            len(ctx.custom_metrics),
+        )
+
+        # 3. Resolve namespace — try common suffixes
+        namespace_candidates = self._generate_namespace_candidates(
+            incident.environment, service, incident.source_tags
+        )
+        for ns_candidate in namespace_candidates:
+            try:
+                # Try to find a metric with this namespace tag
+                test_query = f"avg:kubernetes.cpu.usage.total{{kube_namespace:{ns_candidate}}}"
+                test_results = await self.dd_client.query_metrics(
+                    test_query, incident.start_time, incident.end_time
+                )
+                if test_results and any(s.points for s in test_results):
+                    ctx.resolved_namespace = ns_candidate
+                    ctx.resolved_tags["kube_namespace"] = ns_candidate
+                    logger.info("  Resolved namespace: %s", ns_candidate)
+                    break
+            except Exception as e:
+                logger.debug("  Namespace probe '%s' failed: %s", ns_candidate, e)
+
+        # 4. If we found a namespace, try to discover container/service tags
+        if ctx.resolved_namespace:
+            try:
+                container_query = (
+                    f"avg:kubernetes.cpu.usage.total{{"
+                    f"kube_namespace:{ctx.resolved_namespace},"
+                    f"*{service.split('-')[-1]}*"
+                    f"}}"
+                )
+                # Try to get tag values for the namespace to find service/container
+                tag_values = await self.dd_client.get_metric_tag_values(
+                    "kubernetes.cpu.usage.total", "kube_namespace"
+                )
+                if ctx.resolved_namespace in tag_values:
+                    logger.info("  Confirmed namespace exists in tag values")
+            except Exception as e:
+                logger.debug("  Tag value lookup failed: %s", e)
+
+            # Try to find the container name
+            try:
+                container_values = await self.dd_client.get_metric_tag_values(
+                    "kubernetes.cpu.usage.total", "kube_container_name"
+                )
+                for cv in container_values:
+                    # Match container name against service name parts
+                    if any(part in cv for part in parts if len(part) > 3):
+                        ctx.resolved_tags["kube_container_name"] = cv
+                        logger.info("  Resolved container name: %s", cv)
+                        break
+            except Exception as e:
+                logger.debug("  Container name lookup failed: %s", e)
+
+        # 5. Dashboard mining — find dashboards that reference this service
+        try:
+            dashboards = await self.dd_client.find_dashboards_for_service(service)
+            for dash in dashboards:
+                dash_id = dash.get("id", "")
+                if dash_id:
+                    ctx.dashboard_ids.append(dash_id)
+                dash_metrics = self.dd_client.extract_metrics_from_dashboard(dash)
+                ctx.dashboard_metrics.extend(dash_metrics)
+                logger.info(
+                    "  Dashboard '%s': found %d metrics",
+                    dash.get("title", "unknown"),
+                    len(dash_metrics),
+                )
+        except Exception as e:
+            logger.warning("  Dashboard mining failed: %s", e)
+
+        # Deduplicate dashboard metrics
+        ctx.dashboard_metrics = sorted(set(ctx.dashboard_metrics))
+
+        # 6. If we still have no resolved tags, try host-based tag discovery
+        if not ctx.resolved_tags:
+            try:
+                hosts = await self.dd_client.search_hosts_by_tag(f"service:{service}")
+                if hosts:
+                    host = hosts[0]
+                    host_tags = host.get("tags_by_source", {})
+                    # Flatten all tags to find namespace, cluster, etc.
+                    for source_tags in host_tags.values():
+                        for tag in source_tags:
+                            if ":" in tag:
+                                k, v = tag.split(":", 1)
+                                if k in ("kube_namespace", "kube_cluster_name", "env"):
+                                    ctx.resolved_tags[k] = v
+                    if ctx.resolved_tags:
+                        ctx.resolved_namespace = ctx.resolved_tags.get(
+                            "kube_namespace", ctx.resolved_namespace
+                        )
+                        logger.info("  Resolved tags from host: %s", ctx.resolved_tags)
+            except Exception as e:
+                logger.debug("  Host tag lookup failed: %s", e)
+
+        logger.info(
+            "Step 0 complete: %d metrics, namespace=%s, %d dashboard metrics, tags=%s",
+            len(ctx.available_metrics),
+            ctx.resolved_namespace or "(unresolved)",
+            len(ctx.dashboard_metrics),
+            ctx.resolved_tags,
+        )
+
+        return ctx
+
+    @staticmethod
+    def _generate_namespace_candidates(
+        environment: str, service: str, source_tags: dict[str, str]
+    ) -> list[str]:
+        """Generate namespace candidates to probe, ordered by likelihood."""
+        candidates: list[str] = []
+
+        # If source_tags already have a namespace, try it first
+        if "kube_namespace" in source_tags:
+            candidates.append(source_tags["kube_namespace"])
+
+        # Try to extract namespace from service name patterns
+        # e.g., mk-sp-event-log-router -> mercari-search-platform
+        # Common pattern: the alert text mentions "in <namespace> production"
+        parts = service.split("-")
+
+        # Try the full service name as namespace (unlikely but cheap)
+        candidates.append(service)
+
+        # Common suffixes for production namespaces
+        env_suffixes = ["-prod", "-production", "-prd", ""]
+        env_lower = environment.lower()
+        if "prod" in env_lower:
+            env_suffixes = ["-prod", "-production", "-prd", ""]
+        elif "stag" in env_lower:
+            env_suffixes = ["-staging", "-stg", ""]
+
+        # If source_tags have a namespace hint without env suffix, try with suffixes
+        if "namespace" in source_tags:
+            ns_base = source_tags["namespace"]
+            for suffix in env_suffixes:
+                candidates.append(f"{ns_base}{suffix}")
+
+        # Try prefix-based namespace guessing
+        # e.g., for service "mk-sp-event-log-router" in env "production":
+        # Try: mercari-search-platform-prod, mercari-search-platform-production, etc.
+        if len(parts) >= 2:
+            # Try 2-part and 3-part prefixes with env suffixes
+            for prefix_len in range(2, min(len(parts), 5)):
+                base = "-".join(parts[:prefix_len])
+                for suffix in env_suffixes:
+                    candidates.append(f"{base}{suffix}")
+
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique: list[str] = []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                unique.append(c)
+
+        return unique
+
     # ── Planning ──────────────────────────────────────────────────────
 
     async def _plan_next_action(
@@ -287,6 +553,27 @@ class InvestigationEngine:
         if self.state:
             signal_coverage = format_signal_coverage(self.state.signal_checklist)
 
+        # v3: Include discovered context in planning
+        discovered_context = ""
+        if self.state and self.state.discovered_context:
+            ctx = self.state.discovered_context
+            ctx_parts = []
+            if ctx.resolved_namespace:
+                ctx_parts.append(f"Resolved namespace: {ctx.resolved_namespace}")
+            if ctx.resolved_tags:
+                ctx_parts.append(f"Resolved tags: {ctx.resolved_tags}")
+            if ctx.dashboard_metrics:
+                ctx_parts.append(
+                    f"Dashboard metrics (team monitors these): {', '.join(ctx.dashboard_metrics[:15])}"
+                )
+            if ctx.available_metrics:
+                ctx_parts.append(
+                    f"Available metrics ({len(ctx.available_metrics)} total): "
+                    + ", ".join(ctx.available_metrics[:20])
+                )
+            if ctx_parts:
+                discovered_context = "\n".join(ctx_parts)
+
         prompt = INVESTIGATION_PLANNING_PROMPT.format(
             service=incident.service,
             symptom_type=incident.symptom_type.value,
@@ -303,6 +590,7 @@ class InvestigationEngine:
             data_summary=data_summary or "No data collected yet.",
             current_hypotheses=hypotheses_summary or "No hypotheses formed yet.",
             signal_coverage=signal_coverage or "No checklist configured.",
+            discovered_context=discovered_context or "No discovery performed yet.",
         )
 
         response = await self.reasoning.query_dynamic(prompt)
@@ -323,6 +611,20 @@ class InvestigationEngine:
 
         if action_type == InvestigationActionType.FETCH_METRICS:
             data = await self.dd_client.fetch_service_metrics(service, start, end)
+
+            # If standard APM metrics returned empty, try discovered metrics
+            if not data and self.state and self.state.discovered_context:
+                ctx = self.state.discovered_context
+                discovered_queries = self._build_queries_from_discovered(ctx, service)
+                if discovered_queries:
+                    logger.info("APM metrics empty, trying %d discovered metrics", len(discovered_queries))
+                    import asyncio as _asyncio
+                    tasks = [self.dd_client.query_metrics(q, start, end) for q in discovered_queries[:10]]
+                    results = await _asyncio.gather(*tasks, return_exceptions=True)
+                    for r in results:
+                        if isinstance(r, list):
+                            data.extend(r)
+
             summary = f"{len(data)} metric series for {service}"
             return data, summary
 
@@ -362,7 +664,33 @@ class InvestigationEngine:
             tags = params.get("tags", incident.source_tags)
             if not tags:
                 tags = {"service": service}
+
+            # Use resolved tags from discovery if available
+            if self.state and self.state.discovered_context:
+                ctx = self.state.discovered_context
+                if ctx.resolved_tags:
+                    # Merge discovered tags (don't override explicit params)
+                    merged_tags = dict(ctx.resolved_tags)
+                    merged_tags.update(tags)
+                    tags = merged_tags
+
             data = await self.dd_client.fetch_infra_metrics(tags, start, end)
+
+            # If still empty and we have discovered infra metrics, try those directly
+            if not data and self.state and self.state.discovered_context:
+                ctx = self.state.discovered_context
+                infra_to_try = ctx.infra_metrics + ctx.container_metrics
+                if infra_to_try:
+                    tag_filter = ",".join(f"{k}:{v}" for k, v in tags.items())
+                    logger.info("Infra metrics empty, trying %d discovered infra metrics", len(infra_to_try))
+                    import asyncio as _asyncio
+                    queries = [f"avg:{m}{{{tag_filter}}}" for m in infra_to_try[:8]]
+                    tasks = [self.dd_client.query_metrics(q, start, end) for q in queries]
+                    results = await _asyncio.gather(*tasks, return_exceptions=True)
+                    for r in results:
+                        if isinstance(r, list):
+                            data.extend(r)
+
             summary = f"{len(data)} infra metric series"
             return data, summary
 
@@ -406,6 +734,10 @@ class InvestigationEngine:
             logs = await self.dd_client.fetch_service_logs(service, start, end)
             summary = f"Expanded to {service}: {len(data)} metrics, {len(logs)} logs"
             return {"metrics": data, "logs": logs}, summary
+
+        elif action_type == InvestigationActionType.DISCOVER_CONTEXT:
+            # Discovery is handled in step 0, not via _execute_action
+            return None, "Discovery handled separately"
 
         return None, "Unknown action"
 
@@ -460,7 +792,29 @@ class InvestigationEngine:
             except Exception as e:
                 self.state.data_gap_log.append(f"  Retry {i+1} failed: {e}")
 
-        # Strategy 2: Expand time window
+        # Strategy 2: Try discovered metrics with resolved tags
+        if self.state and self.state.discovered_context:
+            ctx = self.state.discovered_context
+            if ctx.resolved_tags and action_type in (
+                InvestigationActionType.FETCH_INFRA_METRICS,
+                InvestigationActionType.FETCH_METRICS,
+            ):
+                alt_params = dict(params)
+                alt_params["tags"] = ctx.resolved_tags
+                try:
+                    data, summary = await self._execute_action(action_type, alt_params, incident)
+                    if not self._is_empty_result(data):
+                        self.state.data_gap_log.append(
+                            f"  Retry with discovered tags {ctx.resolved_tags}: succeeded"
+                        )
+                        return data, summary
+                    self.state.data_gap_log.append(
+                        f"  Retry with discovered tags: still empty"
+                    )
+                except Exception as e:
+                    self.state.data_gap_log.append(f"  Retry with discovered tags failed: {e}")
+
+        # Strategy 3: Expand time window
         expansion = self.config.time_window_expansion_factor
         expanded_start = incident.start_time - timedelta(
             seconds=(incident.end_time - incident.start_time).total_seconds() * (expansion - 1)
@@ -747,6 +1101,44 @@ class InvestigationEngine:
             for ev in h.contradicting_evidence[-3:]:
                 lines.append(f"    (-) {ev}")
         return "\n".join(lines)
+
+    def _build_queries_from_discovered(
+        self, ctx: DiscoveredContext, service: str
+    ) -> list[str]:
+        """Build Datadog metric queries from discovered metrics.
+
+        Prioritizes dashboard metrics (team already monitors these),
+        then container/infra metrics, then custom metrics.
+        """
+        queries: list[str] = []
+
+        # Build tag filter from resolved tags
+        if ctx.resolved_tags:
+            tag_filter = ",".join(f"{k}:{v}" for k, v in ctx.resolved_tags.items())
+        else:
+            tag_filter = f"service:{service}"
+
+        # Priority 1: Dashboard metrics (these are what the team cares about)
+        for m in ctx.dashboard_metrics[:5]:
+            queries.append(f"avg:{m}{{{tag_filter}}}")
+
+        # Priority 2: Container metrics (CPU, memory at container level)
+        container_priorities = ["container.cpu", "container.memory", "container.io"]
+        for m in ctx.container_metrics:
+            if any(p in m.lower() for p in container_priorities):
+                queries.append(f"avg:{m}{{{tag_filter}}}")
+
+        # Priority 3: Infrastructure (k8s) metrics
+        infra_priorities = ["kubernetes.cpu", "kubernetes.memory", "cpu.throttled"]
+        for m in ctx.infra_metrics:
+            if any(p in m.lower() for p in infra_priorities):
+                queries.append(f"avg:{m}{{{tag_filter}}}")
+
+        # Priority 4: Custom metrics (service-specific)
+        for m in ctx.custom_metrics[:5]:
+            queries.append(f"avg:{m}{{{tag_filter}}}")
+
+        return queries
 
     @staticmethod
     def _is_empty_result(raw_data: Any) -> bool:

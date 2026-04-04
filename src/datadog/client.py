@@ -44,6 +44,212 @@ class DatadogClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    # ── Discovery ────────────────────────────────────────────────────
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def search_metrics(self, query: str) -> list[str]:
+        """Search for available metric names matching a query string.
+
+        Uses GET /api/v1/search?q=metrics:<query> to discover what metrics
+        actually exist for a service or tag pattern.
+        """
+        resp = await self._client.get(
+            "/api/v1/search",
+            params={"q": f"metrics:{query}"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("results", {}).get("metrics", [])
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def list_active_metrics(self, host: str = "") -> list[str]:
+        """List actively reporting metrics (past 24h).
+
+        Uses GET /api/v1/metrics with optional host filter.
+        """
+        import time as _time
+
+        params: dict[str, Any] = {"from": int(_time.time()) - 86400}
+        if host:
+            params["host"] = host
+        resp = await self._client.get("/api/v1/metrics", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("metrics", [])
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def get_metric_tags(self, metric_name: str) -> list[str]:
+        """Get all tag keys for a specific metric.
+
+        Uses GET /api/v2/metrics/{metric_name}/all-tags
+        """
+        safe_name = metric_name.replace("/", "%2F")
+        resp = await self._client.get(f"/api/v2/metrics/{safe_name}/all-tags")
+        resp.raise_for_status()
+        data = resp.json()
+        tags_data = data.get("data", {}).get("attributes", {}).get("tags", [])
+        return tags_data
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def get_metric_tag_values(
+        self, metric_name: str, tag_key: str
+    ) -> list[str]:
+        """Get distinct values for a specific tag on a metric.
+
+        Uses tag filtering via metric search to find values.
+        Falls back to querying with a wildcard and reading tag values from results.
+        """
+        # Query the metric with a wildcard for the tag to discover values
+        import time as _time
+
+        now = int(_time.time())
+        query = f"avg:{metric_name}{{{tag_key}:*}}"
+        resp = await self._client.get(
+            "/api/v1/query",
+            params={"query": query, "from": now - 3600, "to": now},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        values: set[str] = set()
+        for series in data.get("series", []):
+            scope = series.get("scope", "")
+            for part in scope.split(","):
+                part = part.strip()
+                if part.startswith(f"{tag_key}:"):
+                    values.add(part.split(":", 1)[1])
+        return sorted(values)
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def search_hosts_by_tag(self, tag_filter: str) -> list[dict]:
+        """Search for hosts matching a tag filter.
+
+        Uses GET /api/v1/hosts?filter=<tag> to find hosts and their tags.
+        """
+        resp = await self._client.get(
+            "/api/v1/hosts",
+            params={"filter": tag_filter, "count": 10},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("host_list", [])
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def get_tag_values(self, source: str = "") -> dict[str, list[str]]:
+        """Get all host tags and their values.
+
+        Uses GET /api/v1/tags/hosts to enumerate tag keys and values.
+        """
+        params: dict[str, Any] = {}
+        if source:
+            params["source"] = source
+        resp = await self._client.get("/api/v1/tags/hosts", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("tags", {})
+
+    # ── Dashboard Mining ─────────────────────────────────────────────
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def list_dashboards(self) -> list[dict]:
+        """List all dashboards (summary info only).
+
+        Uses GET /api/v1/dashboard to get dashboard list.
+        """
+        resp = await self._client.get("/api/v1/dashboard")
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("dashboards", [])
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def get_dashboard(self, dashboard_id: str) -> dict:
+        """Get full dashboard definition including widgets and queries.
+
+        Uses GET /api/v1/dashboard/{dashboard_id}
+        """
+        resp = await self._client.get(f"/api/v1/dashboard/{dashboard_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def find_dashboards_for_service(self, service: str) -> list[dict]:
+        """Find dashboards that reference a specific service.
+
+        Searches dashboard titles and descriptions for the service name,
+        then fetches full definitions to extract metric queries.
+        """
+        all_dashboards = await self.list_dashboards()
+
+        # Filter dashboards whose title mentions the service or related terms
+        service_lower = service.lower()
+        # Also try shortened forms (e.g., mk-sp-event-log-router -> event-log-router)
+        service_parts = service_lower.split("-")
+        search_terms = [service_lower]
+        if len(service_parts) > 2:
+            search_terms.append("-".join(service_parts[-3:]))
+            search_terms.append("-".join(service_parts[-2:]))
+
+        matching: list[dict] = []
+        for dash in all_dashboards:
+            title = dash.get("title", "").lower()
+            desc = dash.get("description", "").lower()
+            if any(term in title or term in desc for term in search_terms):
+                matching.append(dash)
+
+        # Fetch full details for matching dashboards (max 5 to avoid rate limits)
+        results: list[dict] = []
+        for dash in matching[:5]:
+            try:
+                full = await self.get_dashboard(dash["id"])
+                results.append(full)
+            except Exception as e:
+                logger.warning("Failed to fetch dashboard %s: %s", dash.get("id"), e)
+
+        return results
+
+    @staticmethod
+    def extract_metrics_from_dashboard(dashboard: dict) -> list[str]:
+        """Extract all metric names referenced in a dashboard's widgets."""
+        import re as _re
+
+        metrics: set[str] = set()
+        widgets = dashboard.get("widgets", [])
+
+        def _extract_from_widget(widget: dict) -> None:
+            definition = widget.get("definition", {})
+
+            # Check requests in timeseries, query_value, toplist, etc.
+            for request in definition.get("requests", []):
+                # Standard query format
+                for q_field in ("q", "query"):
+                    query_str = request.get(q_field, "")
+                    if isinstance(query_str, str) and query_str:
+                        # Extract metric name: avg:metric.name{...}
+                        for match in _re.finditer(
+                            r"(?:avg|sum|max|min|count):([a-zA-Z0-9_.]+)\{",
+                            query_str,
+                        ):
+                            metrics.add(match.group(1))
+
+                # Nested queries (formulas, etc.)
+                for query_obj in request.get("queries", []):
+                    if isinstance(query_obj, dict):
+                        q = query_obj.get("query", "")
+                        if isinstance(q, str):
+                            for match in _re.finditer(
+                                r"(?:avg|sum|max|min|count):([a-zA-Z0-9_.]+)\{",
+                                q,
+                            ):
+                                metrics.add(match.group(1))
+
+            # Recurse into nested widgets (groups, etc.)
+            for nested in definition.get("widgets", []):
+                _extract_from_widget(nested)
+
+        for widget in widgets:
+            _extract_from_widget(widget)
+
+        return sorted(metrics)
+
     async def __aenter__(self) -> DatadogClient:
         return self
 
