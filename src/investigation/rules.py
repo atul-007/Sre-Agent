@@ -341,6 +341,27 @@ def can_conclude(
     if not has_evidence and state.hypotheses:
         return False, "No hypothesis has any evidence yet"
 
+    # v3: If leading hypothesis involves a dependency failure, require traces
+    # to be checked before concluding — traces are essential for following
+    # the request flow through downstream services.
+    leading = _get_leading_hypothesis(state.hypotheses) if state.hypotheses else None
+    if leading:
+        dep_keywords = {
+            "dependency", "downstream", "upstream", "component", "service failure",
+            "cascade", "timeout", "connection", "circuit breaker", "unavailable",
+            "failed to get", "internal", "rpc error",
+        }
+        desc_lower = leading.description.lower()
+        is_dependency_hypothesis = any(kw in desc_lower for kw in dep_keywords)
+        if is_dependency_hypothesis:
+            traces_signal = checklist.get("traces")
+            if traces_signal and not traces_signal.checked:
+                return False, (
+                    f"Leading hypothesis involves dependency failure "
+                    f"('{leading.description[:80]}...') but traces have not been checked. "
+                    f"Traces are critical for following the request flow through downstream services."
+                )
+
     return True, "Signal coverage sufficient"
 
 

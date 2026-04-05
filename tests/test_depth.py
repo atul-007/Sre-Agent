@@ -510,3 +510,133 @@ class TestDepthPhaseDependencyFailure:
 
         await depth.run(incident, trace, state, data)
         assert state.depth_steps_taken <= 3
+
+
+# ── gRPC Protobuf Service Name Extraction ──────────────────────────
+
+
+class TestProtobufServiceExtraction:
+    """Tests for gRPC protobuf service name pattern extraction."""
+
+    def _make_incident(self, service="mercari-home-jp"):
+        now = datetime.now(timezone.utc)
+        return IncidentQuery(
+            raw_query="Error logs alert",
+            service=service,
+            symptom_type=SymptomType.ERROR_RATE,
+            start_time=now - timedelta(hours=1),
+            end_time=now,
+        )
+
+    def test_extracts_grpc_protobuf_service(self):
+        """Should extract gRPC protobuf service names like mercari.platform.home.ddui.v1.ComponentService."""
+        incident = self._make_incident()
+        state = InvestigationState()
+        hyp = TrackedHypothesis(
+            id="h1",
+            description="ComponentService failure causing errors",
+            status=HypothesisStatus.INVESTIGATING,
+            supporting_evidence=[
+                "rpc error: code = Internal desc = failed to get components on service call to mercari.platform.home.ddui.v1.ComponentService",
+            ],
+        )
+        result = DepthPhase._extract_services_from_evidence(hyp, state, incident)
+        service_names = [s["service_name"] for s in result]
+        assert "mercari.platform.home.ddui.v1.ComponentService" in service_names
+
+    def test_protobuf_service_has_high_priority(self):
+        """gRPC protobuf services should have high investigation priority."""
+        incident = self._make_incident()
+        state = InvestigationState()
+        hyp = TrackedHypothesis(
+            id="h1",
+            description="Service failure",
+            status=HypothesisStatus.INVESTIGATING,
+            supporting_evidence=[
+                "Method call to service mercari.platform.search.v2.SearchService returned Internal",
+            ],
+        )
+        result = DepthPhase._extract_services_from_evidence(hyp, state, incident)
+        proto_services = [s for s in result if "." in s["service_name"]]
+        assert len(proto_services) > 0
+        assert proto_services[0]["investigation_priority"] == "high"
+        assert proto_services[0]["source"] == "gRPC protobuf service name"
+
+
+# ── can_conclude Traces Requirement Tests ──────────────────────────
+
+
+class TestCanConcludeTracesRequirement:
+    """Tests for can_conclude requiring traces for dependency hypotheses."""
+
+    def test_blocks_conclude_when_traces_unchecked_and_dependency_hypothesis(self):
+        """Should block conclusion when traces aren't checked and leading hypothesis is about dependency."""
+        from src.investigation.rules import can_conclude, build_signal_checklist
+        from src.models.incident import SignalCheckResult
+
+        state = InvestigationState(
+            signal_checklist=build_signal_checklist("error_rate"),
+        )
+        # Mark most signals as checked except traces
+        for sig in state.signal_checklist:
+            if sig != "traces":
+                state.signal_checklist[sig].checked = True
+                state.signal_checklist[sig].data_found = True
+
+        # Add a dependency failure hypothesis
+        state.hypotheses["h1"] = TrackedHypothesis(
+            id="h1",
+            description="ComponentService dependency failure causing cascading errors",
+            status=HypothesisStatus.CONFIRMED,
+            confidence=0.90,
+            supporting_evidence=["Service returned Internal errors"],
+        )
+
+        ok, reason = can_conclude(state)
+        assert not ok
+        assert "traces" in reason.lower()
+
+    def test_allows_conclude_when_traces_checked(self):
+        """Should allow conclusion when traces ARE checked, even with dependency hypothesis."""
+        from src.investigation.rules import can_conclude, build_signal_checklist
+
+        state = InvestigationState(
+            signal_checklist=build_signal_checklist("error_rate"),
+        )
+        for sig in state.signal_checklist:
+            state.signal_checklist[sig].checked = True
+            state.signal_checklist[sig].data_found = True
+
+        state.hypotheses["h1"] = TrackedHypothesis(
+            id="h1",
+            description="Downstream service timeout causing cascade",
+            status=HypothesisStatus.CONFIRMED,
+            confidence=0.90,
+            supporting_evidence=["Service timed out"],
+        )
+
+        ok, reason = can_conclude(state)
+        assert ok
+
+    def test_allows_conclude_without_dependency_hypothesis(self):
+        """Should allow conclusion without traces when hypothesis is NOT about dependencies."""
+        from src.investigation.rules import can_conclude, build_signal_checklist
+
+        state = InvestigationState(
+            signal_checklist=build_signal_checklist("error_rate"),
+        )
+        for sig in state.signal_checklist:
+            if sig != "traces":
+                state.signal_checklist[sig].checked = True
+                state.signal_checklist[sig].data_found = True
+
+        state.hypotheses["h1"] = TrackedHypothesis(
+            id="h1",
+            description="CPU saturation caused OOM kills on hot pod",
+            status=HypothesisStatus.CONFIRMED,
+            confidence=0.80,
+            supporting_evidence=["CPU at 95%"],
+        )
+
+        ok, reason = can_conclude(state)
+        assert ok

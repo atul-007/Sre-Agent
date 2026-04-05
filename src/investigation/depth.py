@@ -411,6 +411,26 @@ class DepthPhase:
                     "investigation_priority": "medium",
                 })
 
+        # Pattern 5: gRPC protobuf service names (e.g., mercari.platform.home.ddui.v1.ComponentService)
+        # These need to be mapped to K8s service names by Claude, but we capture the
+        # package prefix which often maps to a team/service namespace
+        for match in re.finditer(
+            r"(?:service|method|rpc)\s+(?:call\s+)?(?:to\s+)?([a-z][a-z0-9]+(?:\.[a-z][a-z0-9]+){2,}\.[A-Z][a-zA-Z]+)",
+            all_text,
+        ):
+            proto_svc = match.group(1)
+            # Extract a likely K8s-friendly name from the protobuf path
+            # e.g., mercari.platform.home.ddui.v1.ComponentService -> ComponentService
+            parts = proto_svc.split(".")
+            svc_name = parts[-1]  # e.g., ComponentService
+            # Use the full protobuf name as hint for Claude
+            services.setdefault(proto_svc, {
+                "service_name": proto_svc,
+                "source": "gRPC protobuf service name",
+                "likely_k8s_namespace": "",
+                "investigation_priority": "high",
+            })
+
         return list(services.values())
 
     async def _investigate_downstream_service(

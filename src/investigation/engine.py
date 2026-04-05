@@ -169,27 +169,51 @@ class InvestigationEngine:
                 )
 
             # ── Phase 3: Depth (if hypothesis needs it) ──────────────
-            # Depth should run when:
-            # 1. A leading hypothesis exists with meaningful confidence
-            # 2. Confidence is below the "solved" threshold (otherwise depth is redundant)
-            # Note: breadth setting trace.concluded=True does NOT mean the case is solved;
-            # it means breadth's signal checklist is sufficiently covered.
-            # Time budget is enforced WITHIN the depth phase (per-step), not as a gate
-            # to entering it — depth is the most valuable phase for dependency failures.
+            # Depth should run when EITHER:
+            # 1. Leading hypothesis has meaningful confidence but below "solved" threshold
+            # 2. Leading hypothesis involves a dependency failure (always investigate
+            #    downstream, even at high confidence — "X service failed" is a symptom,
+            #    not a root cause; we need to find WHY it failed)
             if True:
                 leading = max(
                     self.state.hypotheses.values(), key=lambda h: h.confidence
                 ) if self.state.hypotheses else None
 
-                if (
-                    leading
-                    and leading.confidence >= 0.10
-                    and leading.confidence < self.confidence_threshold
-                ):
+                should_depth = False
+                depth_reason = ""
+
+                if leading and leading.confidence >= 0.10:
+                    if leading.confidence < self.confidence_threshold:
+                        should_depth = True
+                        depth_reason = f"confidence {leading.confidence:.0%} below threshold"
+                    else:
+                        # Always enter depth for dependency failures — identifying
+                        # the failing service is the START, not the end.
+                        from src.investigation.rules import classify_hypothesis
+                        category = classify_hypothesis(leading.description)
+                        dep_keywords = {
+                            "dependency", "downstream", "upstream", "component",
+                            "service failure", "cascade", "timeout", "connection",
+                            "circuit breaker", "unavailable", "failed to get",
+                            "internal", "rpc error",
+                        }
+                        desc_lower = leading.description.lower()
+                        is_dep = (
+                            category == "dependency_failure"
+                            or any(kw in desc_lower for kw in dep_keywords)
+                        )
+                        if is_dep:
+                            should_depth = True
+                            depth_reason = (
+                                f"dependency failure hypothesis at {leading.confidence:.0%} — "
+                                f"need to trace downstream to find WHY the dependency failed"
+                            )
+
+                if should_depth:
                     self.state.phase = "depth"
                     logger.info(
-                        "Entering depth phase: leading hypothesis at %.0f%% confidence",
-                        leading.confidence * 100,
+                        "Entering depth phase: %s",
+                        depth_reason,
                     )
                     try:
                         from src.investigation.depth import DepthPhase
