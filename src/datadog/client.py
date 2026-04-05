@@ -455,13 +455,18 @@ class DatadogClient:
         start_utc = ensure_utc(start)
         end_utc = ensure_utc(end)
         body = {
-            "filter": {
-                "query": query,
-                "from": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "to": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            },
-            "sort": "timestamp",
-            "page": {"limit": min(limit, 500)},
+            "data": {
+                "type": "search_request",
+                "attributes": {
+                    "filter": {
+                        "query": query,
+                        "from": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "to": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    },
+                    "sort": "timestamp",
+                    "page": {"limit": min(limit, 500)},
+                },
+            }
         }
         resp = await self._client.post("/api/v2/spans/events/search", json=body)
         resp.raise_for_status()
@@ -470,20 +475,44 @@ class DatadogClient:
         spans: list[TraceSpan] = []
         for item in data.get("data", []):
             attrs = item.get("attributes", {})
+            custom = attrs.get("custom", {})
+            error_info = custom.get("error", {})
+            top_error = attrs.get("error", {})
+
+            # Parse start_timestamp (ISO 8601 string like "2026-04-01T05:57:04.208Z")
+            start_ts_str = attrs.get("start_timestamp", "")
+            if start_ts_str:
+                try:
+                    start_ts = datetime.fromisoformat(start_ts_str.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    start_ts = datetime.now(timezone.utc)
+            else:
+                start_ts = datetime.now(timezone.utc)
+
+            # Build meta dict from custom fields (excluding large nested objects)
+            meta: dict[str, str] = {}
+            for k, v in custom.items():
+                if isinstance(v, str):
+                    meta[k] = v
+                elif isinstance(v, dict) and k == "error":
+                    for ek, ev in v.items():
+                        if isinstance(ev, str):
+                            meta[f"error.{ek}"] = ev
+
             spans.append(
                 TraceSpan(
-                    trace_id=attrs.get("trace_id", ""),
-                    span_id=attrs.get("span_id", ""),
-                    parent_id=attrs.get("parent_id", ""),
+                    trace_id=str(attrs.get("trace_id", "")),
+                    span_id=str(attrs.get("span_id", "")),
+                    parent_id=str(attrs.get("parent_id", "")),
                     service=attrs.get("service", ""),
                     operation=attrs.get("operation_name", ""),
                     resource=attrs.get("resource_name", ""),
-                    duration_ns=attrs.get("duration", 0),
-                    start_time=safe_timestamp(attrs.get("start", 0) / 1e9),
-                    status="error" if attrs.get("is_error") else "ok",
-                    error_message=attrs.get("meta", {}).get("error.message", ""),
-                    error_type=attrs.get("meta", {}).get("error.type", ""),
-                    meta=attrs.get("meta", {}),
+                    duration_ns=custom.get("duration", 0),
+                    start_time=start_ts,
+                    status=attrs.get("status", "ok"),
+                    error_message=error_info.get("message", ""),
+                    error_type=top_error.get("type", "") if isinstance(top_error, dict) else str(top_error),
+                    meta=meta,
                 )
             )
         return spans
