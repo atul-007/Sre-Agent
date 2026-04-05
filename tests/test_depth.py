@@ -261,3 +261,252 @@ class TestDepthPhase:
 
         await depth.run(incident, trace, state, data)
         assert trace.total_steps == 0
+
+
+# ── Cross-Service Investigation Tests ──────────────────────────────
+
+
+class TestExtractServicesFromEvidence:
+    """Tests for DepthPhase._extract_services_from_evidence."""
+
+    def _make_incident(self, service="my-service"):
+        now = datetime.now(timezone.utc)
+        return IncidentQuery(
+            raw_query="Circuit breaker alert",
+            service=service,
+            symptom_type=SymptomType.AVAILABILITY,
+            start_time=now - timedelta(hours=1),
+            end_time=now,
+        )
+
+    def test_extracts_from_service_tag(self):
+        """Should extract downstream service from circuit breaker from-service tag."""
+        incident = self._make_incident("mercari-product-search-jp")
+        state = InvestigationState()
+        hyp = TrackedHypothesis(
+            id="h1",
+            description="Downstream dependency failure via circuit breaker",
+            status=HypothesisStatus.INVESTIGATING,
+            supporting_evidence=[
+                "Circuit breaker opened for from-service:mercari-searchx-jp to search-service:triton-text-embeddings-ruri-small-v2-ft",
+                "Stable throughput at primary service",
+            ],
+            contradicting_evidence=[],
+        )
+        result = DepthPhase._extract_services_from_evidence(hyp, state, incident)
+        service_names = [s["service_name"] for s in result]
+        assert "mercari-searchx-jp" in service_names or "triton-text-embeddings-ruri-small-v2-ft" in service_names
+
+    def test_extracts_k8s_endpoint(self):
+        """Should extract service and namespace from Kubernetes service endpoints."""
+        incident = self._make_incident()
+        state = InvestigationState()
+        hyp = TrackedHypothesis(
+            id="h1",
+            description="Downstream timeout",
+            status=HypothesisStatus.INVESTIGATING,
+            supporting_evidence=[
+                "Error connecting to triton-text-embeddings-ruri-small-v2.mercari-embeddings-jp-prod.svc.cluster.local:8001",
+            ],
+        )
+        result = DepthPhase._extract_services_from_evidence(hyp, state, incident)
+        assert len(result) > 0
+        svc = result[0]
+        assert svc["service_name"] == "triton-text-embeddings-ruri-small-v2"
+        assert svc["likely_k8s_namespace"] == "mercari-embeddings-jp-prod"
+
+    def test_ignores_primary_service(self):
+        """Should not return the primary service being investigated."""
+        incident = self._make_incident("my-service")
+        state = InvestigationState()
+        hyp = TrackedHypothesis(
+            id="h1",
+            description="Dependency failure",
+            status=HypothesisStatus.INVESTIGATING,
+            supporting_evidence=[
+                "from-service:my-service had errors",
+                "search-service:downstream-svc was unavailable",
+            ],
+        )
+        result = DepthPhase._extract_services_from_evidence(hyp, state, incident)
+        service_names = [s["service_name"] for s in result]
+        assert "my-service" not in service_names
+        assert "downstream-svc" in service_names
+
+    def test_no_services_found(self):
+        """Should return empty when no downstream services in evidence."""
+        incident = self._make_incident()
+        state = InvestigationState()
+        hyp = TrackedHypothesis(
+            id="h1",
+            description="Generic issue",
+            status=HypothesisStatus.INVESTIGATING,
+            supporting_evidence=["CPU is high", "Memory is fine"],
+        )
+        result = DepthPhase._extract_services_from_evidence(hyp, state, incident)
+        assert len(result) == 0
+
+    def test_rejects_english_words(self):
+        """Should NOT extract common English words like 'pairs', 'issue', 'failure'."""
+        incident = self._make_incident("mercari-product-search-jp")
+        state = InvestigationState()
+        hyp = TrackedHypothesis(
+            id="h1",
+            description="Downstream dependency failure",
+            status=HypothesisStatus.INVESTIGATING,
+            supporting_evidence=[
+                "from-service and search-service pairs triggered the circuit breaker",
+                "The downstream failure caused cascading issues",
+                "Still investigating the service map dependency",
+            ],
+        )
+        result = DepthPhase._extract_services_from_evidence(hyp, state, incident)
+        service_names = [s["service_name"] for s in result]
+        # None of these common English words should be extracted
+        for bad in ["pairs", "issue", "failure", "failures", "service", "services", "Still", "search"]:
+            assert bad not in service_names, f"'{bad}' should not be extracted as service name"
+
+
+class TestBuildDownstreamQueries:
+    """Tests for DepthPhase._build_downstream_queries."""
+
+    def _make_incident(self):
+        now = datetime.now(timezone.utc)
+        return IncidentQuery(
+            raw_query="alert",
+            service="primary-svc",
+            symptom_type=SymptomType.AVAILABILITY,
+            start_time=now - timedelta(hours=1),
+            end_time=now,
+        )
+
+    def test_generates_queries(self):
+        incident = self._make_incident()
+        queries = DepthPhase._build_downstream_queries(
+            "triton-text-embeddings", "mercari-embeddings-prod", incident,
+        )
+        assert len(queries) >= 4
+        signals = [q["signal"] for q in queries]
+        assert any("error_logs" in s for s in signals)
+        assert any("mentions" in s for s in signals)
+        assert any("restarts" in s for s in signals)
+        assert any("cpu" in s for s in signals)
+
+    def test_uses_namespace_in_queries(self):
+        incident = self._make_incident()
+        queries = DepthPhase._build_downstream_queries(
+            "triton-svc", "my-namespace", incident,
+        )
+        # Namespace should be used in log and metric queries
+        ns_queries = [q for q in queries if "my-namespace" in q["query"]]
+        assert len(ns_queries) >= 2
+
+    def test_no_namespace_uses_service_tag(self):
+        incident = self._make_incident()
+        queries = DepthPhase._build_downstream_queries(
+            "downstream-svc", "", incident,
+        )
+        # Without namespace, should use service tag
+        svc_queries = [q for q in queries if "service:downstream-svc" in q["query"]]
+        assert len(svc_queries) >= 1
+
+    def test_includes_probe_failures_with_namespace(self):
+        incident = self._make_incident()
+        queries = DepthPhase._build_downstream_queries(
+            "triton-svc", "my-namespace", incident,
+        )
+        probe_queries = [q for q in queries if "probe" in q["query"].lower() or "SIGTERM" in q["query"]]
+        assert len(probe_queries) >= 1
+
+
+class TestDepthPhaseDependencyFailure:
+    """Tests for cross-service depth investigation."""
+
+    def _make_depth_phase(self, max_depth_steps=10):
+        config = AgentConfig(max_depth_steps=max_depth_steps)
+        dd = AsyncMock()
+        correlation = MagicMock()
+        executor = ActionExecutor(dd, correlation, config)
+        reasoning = MagicMock()
+        reasoning.query_dynamic = AsyncMock(return_value='{"supports": true, "is_source": true, "root_cause": "Pod crash", "mechanism": "SIGTERM during model load", "evidence_summary": "Pod restarted", "confidence_delta": 0.15, "further_downstream": "", "further_downstream_reason": "", "downstream_services": []}')
+        analysis = AnalysisPhase(reasoning, correlation, config)
+        depth = DepthPhase(executor, analysis, reasoning, config)
+        return depth, dd, reasoning
+
+    def _make_incident(self):
+        now = datetime.now(timezone.utc)
+        return IncidentQuery(
+            raw_query="Circuit breaker open for product-search",
+            service="product-search",
+            symptom_type=SymptomType.AVAILABILITY,
+            start_time=now - timedelta(hours=1),
+            end_time=now,
+        )
+
+    @pytest.mark.asyncio
+    async def test_classifies_dependency_failure(self):
+        """Hypothesis with circuit breaker/downstream keywords should classify as dependency_failure."""
+        assert classify_hypothesis("Downstream service timeout causing circuit breaker to open") == "dependency_failure"
+        assert classify_hypothesis("Circuit breaker opened due to cascade failure") == "dependency_failure"
+
+    @pytest.mark.asyncio
+    async def test_cross_service_runs_for_dependency(self):
+        """Depth phase should investigate downstream services for dependency_failure."""
+        depth, dd, reasoning = self._make_depth_phase()
+        incident = self._make_incident()
+        state = InvestigationState()
+        state.hypotheses["h1"] = TrackedHypothesis(
+            id="h1",
+            description="Downstream service timeout causing circuit breaker cascade",
+            status=HypothesisStatus.INVESTIGATING,
+            confidence=0.35,
+            supporting_evidence=[
+                "Circuit breaker opened for from-service:searchx-jp to search-service:triton-embeddings",
+            ],
+        )
+        trace = InvestigationTrace()
+        data = ObservabilityData()
+
+        from src.models.incident import LogEntry
+        dd.query_metrics = AsyncMock(return_value=[])
+        dd.search_logs = AsyncMock(return_value=[
+            LogEntry(timestamp=incident.start_time, message="error", service="triton", status="error"),
+        ])
+        dd.get_events = AsyncMock(return_value=[])
+        dd.get_triggered_monitors = AsyncMock(return_value=[])
+
+        await depth.run(incident, trace, state, data)
+
+        # Should have run depth steps investigating the downstream service
+        assert trace.total_steps > 0
+        assert state.depth_steps_taken > 0
+        # Should have investigated triton-embeddings or searchx-jp
+        data_sources = [s.data_source for s in trace.steps]
+        assert any(ds != "product-search" for ds in data_sources), \
+            f"Expected downstream service investigation, got: {data_sources}"
+
+    @pytest.mark.asyncio
+    async def test_respects_max_depth_across_services(self):
+        """Max depth steps should be respected even during cross-service investigation."""
+        depth, dd, reasoning = self._make_depth_phase(max_depth_steps=3)
+        incident = self._make_incident()
+        state = InvestigationState()
+        state.hypotheses["h1"] = TrackedHypothesis(
+            id="h1",
+            description="Downstream circuit breaker cascade failure",
+            status=HypothesisStatus.INVESTIGATING,
+            confidence=0.35,
+            supporting_evidence=[
+                "from-service:caller to search-service:downstream-a",
+            ],
+        )
+        trace = InvestigationTrace()
+        data = ObservabilityData()
+
+        dd.query_metrics = AsyncMock(return_value=[])
+        dd.search_logs = AsyncMock(return_value=[])
+        dd.get_events = AsyncMock(return_value=[])
+        dd.get_triggered_monitors = AsyncMock(return_value=[])
+
+        await depth.run(incident, trace, state, data)
+        assert state.depth_steps_taken <= 3

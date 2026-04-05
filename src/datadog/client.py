@@ -287,12 +287,23 @@ class DatadogClient:
                 )
                 for pt in series.get("pointlist", [])
             ]
+            # Extract tag values from scope (e.g., "from-service:svc-a,search-service:svc-b")
+            scope = series.get("scope", "")
+            tags: dict[str, str] = {}
+            if scope:
+                for part in scope.split(","):
+                    if ":" in part:
+                        k, v = part.split(":", 1)
+                        tags[k.strip()] = v.strip()
+
             results.append(
                 MetricSeries(
                     metric_name=series.get("metric", query),
                     display_name=series.get("display_name", series.get("expression", query)),
                     points=points,
                     unit=series.get("unit", [{}])[0].get("name", "") if series.get("unit") else "",
+                    tags=tags,
+                    scope=scope,
                 )
             )
         return results

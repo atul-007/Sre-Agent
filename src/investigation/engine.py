@@ -168,20 +168,40 @@ class InvestigationEngine:
                     incident, trace, self.state, accumulated_data, self.max_steps
                 )
 
-            # ── Phase 3: Depth (if time remains) ─────────────────────
-            if not trace.concluded and not self._time_exceeded():
-                self.state.phase = "depth"
-                try:
-                    from src.investigation.depth import DepthPhase
-                    depth = DepthPhase(
-                        executor, analysis, self.reasoning, self.config,
-                        self.on_step_complete,
+            # ── Phase 3: Depth (if hypothesis needs it) ──────────────
+            # Depth should run when:
+            # 1. A leading hypothesis exists with meaningful confidence
+            # 2. Confidence is below the "solved" threshold (otherwise depth is redundant)
+            # Note: breadth setting trace.concluded=True does NOT mean the case is solved;
+            # it means breadth's signal checklist is sufficiently covered.
+            # Time budget is enforced WITHIN the depth phase (per-step), not as a gate
+            # to entering it — depth is the most valuable phase for dependency failures.
+            if True:
+                leading = max(
+                    self.state.hypotheses.values(), key=lambda h: h.confidence
+                ) if self.state.hypotheses else None
+
+                if (
+                    leading
+                    and leading.confidence >= 0.10
+                    and leading.confidence < self.confidence_threshold
+                ):
+                    self.state.phase = "depth"
+                    logger.info(
+                        "Entering depth phase: leading hypothesis at %.0f%% confidence",
+                        leading.confidence * 100,
                     )
-                    await depth.run(incident, trace, self.state, accumulated_data)
-                except ImportError:
-                    logger.debug("Depth phase not available")
-                except Exception as e:
-                    logger.warning("Depth phase failed (non-fatal): %s", e)
+                    try:
+                        from src.investigation.depth import DepthPhase
+                        depth = DepthPhase(
+                            executor, analysis, self.reasoning, self.config,
+                            self.on_step_complete,
+                        )
+                        await depth.run(incident, trace, self.state, accumulated_data)
+                    except ImportError:
+                        logger.debug("Depth phase not available")
+                    except Exception as e:
+                        logger.warning("Depth phase failed (non-fatal): %s", e)
 
         # Finalize trace
         if not trace.concluded:

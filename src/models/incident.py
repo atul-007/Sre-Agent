@@ -52,6 +52,8 @@ class MetricSeries(BaseModel):
     points: list[MetricDataPoint]
     unit: str = ""
     aggregation: str = "avg"
+    tags: dict[str, str] = Field(default_factory=dict)
+    scope: str = ""
 
 
 class LogEntry(BaseModel):

@@ -371,3 +371,67 @@ Respond in JSON:
     "confidence_delta": 0.0,
     "next_query_suggestion": "<what one query would most help narrow down the mechanism>"
 }}"""
+
+
+DOWNSTREAM_EXTRACTION_PROMPT = """You are analyzing evidence from a service investigation to identify \
+downstream services that should be investigated next.
+
+**Primary service under investigation:** {service}
+**Leading hypothesis:** {hypothesis}
+
+**Evidence collected so far:**
+{evidence}
+
+**Raw data samples (metric names, log entries, tags):**
+{raw_data_samples}
+
+Extract any downstream or dependency service names mentioned in the evidence. Look for:
+- Service names in circuit breaker tags (from-service, search-service, peer_service)
+- Service names in error messages (connection to X failed, timeout calling Y)
+- Service names in metric tags (downstream_service, target_service)
+- gRPC service names that map to Kubernetes deployments
+- Kubernetes service endpoints mentioned in logs
+
+Respond in JSON:
+{{
+    "downstream_services": [
+        {{
+            "service_name": "<exact service name as it appears in evidence>",
+            "source": "<where you found it: circuit breaker tag, error log, etc.>",
+            "likely_k8s_namespace": "<best guess at namespace, or empty string>",
+            "investigation_priority": "<high/medium/low>"
+        }}
+    ],
+    "reasoning": "<why these services are relevant>"
+}}"""
+
+
+DOWNSTREAM_DEPTH_PROMPT = """You are investigating a DOWNSTREAM SERVICE that is suspected of causing \
+an incident in the upstream service.
+
+**Upstream service:** {upstream_service}
+**Downstream service being investigated:** {downstream_service}
+**Hypothesis:** {hypothesis}
+**Category:** {category}
+
+**New data from investigating the downstream service ({query_description}):**
+{data_content}
+
+**What we know so far about the incident:**
+{context}
+
+Based on this data from the downstream service:
+1. Is this downstream service the actual source of the failure? What specific evidence?
+2. Can you identify the ROOT CAUSE at this level? (pod crash, resource exhaustion, deployment, config change, etc.)
+3. Should we investigate FURTHER downstream (i.e., this service's own dependencies)?
+
+Respond in JSON:
+{{
+    "is_source": true,
+    "root_cause": "<specific root cause if identifiable, e.g., 'Triton pod crash during model reload'>",
+    "mechanism": "<detailed mechanism, e.g., 'GPU model loading from HuggingFace took 5 minutes, during which readiness probe failed'>",
+    "evidence_summary": "<what the data shows>",
+    "confidence_delta": 0.0,
+    "further_downstream": "<service name to investigate next, or empty string>",
+    "further_downstream_reason": "<why investigate that service>"
+}}"""

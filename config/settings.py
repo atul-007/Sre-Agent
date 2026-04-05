@@ -57,6 +57,6 @@ class AgentConfig:
     confidence_cap_on_sparse_data: float = 0.4
     confidence_cap_no_direct_evidence: float = 0.6
     # v3 investigation settings
-    max_investigation_seconds: int = 180
-    max_depth_steps: int = 5
+    max_investigation_seconds: int = 600
+    max_depth_steps: int = 10
     auto_per_pod_breakdown: bool = True
