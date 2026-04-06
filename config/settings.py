@@ -59,4 +59,5 @@ class AgentConfig:
     # v3 investigation settings
     max_investigation_seconds: int = 600
     max_depth_steps: int = 10
+    max_downstream_steps: int = 15
     auto_per_pod_breakdown: bool = True

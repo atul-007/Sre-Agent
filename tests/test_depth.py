@@ -19,8 +19,10 @@ from src.models.incident import (
     IncidentQuery,
     InvestigationState,
     InvestigationTrace,
+    LogEntry,
     ObservabilityData,
     SymptomType,
+    TraceSpan,
     TrackedHypothesis,
     HypothesisStatus,
 )
@@ -387,8 +389,8 @@ class TestBuildDownstreamQueries:
         )
         assert len(queries) >= 4
         signals = [q["signal"] for q in queries]
+        assert any("error_traces" in s for s in signals)
         assert any("error_logs" in s for s in signals)
-        assert any("mentions" in s for s in signals)
         assert any("restarts" in s for s in signals)
         assert any("cpu" in s for s in signals)
 
@@ -422,8 +424,8 @@ class TestBuildDownstreamQueries:
 class TestDepthPhaseDependencyFailure:
     """Tests for cross-service depth investigation."""
 
-    def _make_depth_phase(self, max_depth_steps=10):
-        config = AgentConfig(max_depth_steps=max_depth_steps)
+    def _make_depth_phase(self, max_depth_steps=10, max_downstream_steps=15):
+        config = AgentConfig(max_depth_steps=max_depth_steps, max_downstream_steps=max_downstream_steps)
         dd = AsyncMock()
         correlation = MagicMock()
         executor = ActionExecutor(dd, correlation, config)
@@ -487,8 +489,8 @@ class TestDepthPhaseDependencyFailure:
 
     @pytest.mark.asyncio
     async def test_respects_max_depth_across_services(self):
-        """Max depth steps should be respected even during cross-service investigation."""
-        depth, dd, reasoning = self._make_depth_phase(max_depth_steps=3)
+        """Max downstream steps should be respected during cross-service investigation."""
+        depth, dd, reasoning = self._make_depth_phase(max_depth_steps=10, max_downstream_steps=3)
         incident = self._make_incident()
         state = InvestigationState()
         state.hypotheses["h1"] = TrackedHypothesis(
@@ -509,7 +511,7 @@ class TestDepthPhaseDependencyFailure:
         dd.get_triggered_monitors = AsyncMock(return_value=[])
 
         await depth.run(incident, trace, state, data)
-        assert state.depth_steps_taken <= 3
+        assert state.downstream_steps_taken <= 3
 
 
 # ── gRPC Protobuf Service Name Extraction ──────────────────────────
@@ -640,3 +642,308 @@ class TestCanConcludeTracesRequirement:
 
         ok, reason = can_conclude(state)
         assert ok
+
+
+# ── Early Exit Tests ─────────────────────────────────────────────────
+
+
+class TestEarlyExitOnVictim:
+    """Tests for adaptive per-service budget with early exit."""
+
+    def _make_depth_phase(self, max_downstream_steps=15):
+        config = AgentConfig(max_downstream_steps=max_downstream_steps)
+        dd = AsyncMock()
+        correlation = MagicMock()
+        executor = ActionExecutor(dd, correlation, config)
+        reasoning = MagicMock()
+        analysis = AnalysisPhase(reasoning, correlation, config)
+        depth = DepthPhase(executor, analysis, reasoning, config)
+        return depth, dd, reasoning
+
+    def _make_incident(self):
+        now = datetime.now(timezone.utc)
+        return IncidentQuery(
+            raw_query="Error rate spike",
+            service="my-service",
+            symptom_type=SymptomType.ERROR_RATE,
+            start_time=now - timedelta(hours=1),
+            end_time=now,
+        )
+
+    @pytest.mark.asyncio
+    async def test_early_exit_on_victim_service(self):
+        """Victim service (context canceled) should cost 1 step, not 5."""
+        depth, dd, reasoning = self._make_depth_phase()
+
+        dd.search_traces = AsyncMock(return_value=[
+            TraceSpan(
+                trace_id="abc", span_id="s1", service="downstream-svc",
+                operation="grpc.server", resource="GetData",
+                duration_ns=5_000_000, start_time=datetime.now(timezone.utc),
+                status="error", error_message="context canceled",
+                meta={"error.handling": "handled"},
+            ),
+        ])
+        dd.search_logs = AsyncMock(return_value=[])
+        dd.query_metrics = AsyncMock(return_value=[])
+        dd.get_triggered_monitors = AsyncMock(return_value=[])
+
+        reasoning.query_dynamic = AsyncMock(return_value='{"is_source": false, "root_cause": "", "mechanism": "context canceled from upstream timeout propagation", "evidence_summary": "All errors are context cancellations", "confidence_delta": -0.05, "further_downstream": "", "further_downstream_reason": ""}')
+
+        incident = self._make_incident()
+        state = InvestigationState()
+        leading = TrackedHypothesis(
+            id="h1", description="Dependency failure",
+            status=HypothesisStatus.INVESTIGATING, confidence=0.4,
+        )
+        state.hypotheses["h1"] = leading
+        trace = InvestigationTrace()
+        data = ObservabilityData()
+
+        initial = state.downstream_steps_taken
+        await depth._investigate_downstream_service(
+            "downstream-svc", "", incident, trace, state, data, leading, "dependency_failure",
+        )
+        # Should have taken only 1 step (traces), not 5
+        assert state.downstream_steps_taken - initial == 1
+        # Should have early-exit evidence
+        assert any("early-exit" in e for e in leading.contradicting_evidence)
+
+    @pytest.mark.asyncio
+    async def test_no_early_exit_on_source_service(self):
+        """Source service (is_source=True) should run all queries."""
+        depth, dd, reasoning = self._make_depth_phase()
+
+        dd.search_traces = AsyncMock(return_value=[
+            TraceSpan(
+                trace_id="abc", span_id="s1", service="downstream-svc",
+                operation="grpc.server", resource="GetData",
+                duration_ns=5_000_000, start_time=datetime.now(timezone.utc),
+                status="error", error_message="internal server error",
+            ),
+        ])
+        dd.search_logs = AsyncMock(return_value=[])
+        dd.query_metrics = AsyncMock(return_value=[])
+        dd.get_triggered_monitors = AsyncMock(return_value=[])
+
+        reasoning.query_dynamic = AsyncMock(return_value='{"is_source": true, "root_cause": "OOM kill", "mechanism": "Memory exhaustion causing pod restart", "evidence_summary": "Pod OOM killed", "confidence_delta": 0.2, "further_downstream": "", "further_downstream_reason": ""}')
+
+        incident = self._make_incident()
+        state = InvestigationState()
+        leading = TrackedHypothesis(
+            id="h1", description="Dependency failure",
+            status=HypothesisStatus.INVESTIGATING, confidence=0.4,
+        )
+        state.hypotheses["h1"] = leading
+        trace = InvestigationTrace()
+        data = ObservabilityData()
+
+        initial = state.downstream_steps_taken
+        await depth._investigate_downstream_service(
+            "downstream-svc", "", incident, trace, state, data, leading, "dependency_failure",
+        )
+        # Should have taken more than 1 step (full investigation)
+        assert state.downstream_steps_taken - initial >= 4
+
+    @pytest.mark.asyncio
+    async def test_no_early_exit_on_empty_traces(self):
+        """Empty first query should not trigger early exit — continue investigating."""
+        depth, dd, reasoning = self._make_depth_phase()
+
+        dd.search_traces = AsyncMock(return_value=[])
+        dd.search_logs = AsyncMock(return_value=[
+            LogEntry(
+                timestamp=datetime.now(timezone.utc),
+                message="connection refused",
+                service="downstream-svc",
+                status="error",
+            ),
+        ])
+        dd.query_metrics = AsyncMock(return_value=[])
+        dd.get_triggered_monitors = AsyncMock(return_value=[])
+
+        reasoning.query_dynamic = AsyncMock(return_value='{"is_source": true, "root_cause": "Connection refused", "mechanism": "Service crashed", "evidence_summary": "Connection refused errors", "confidence_delta": 0.1, "further_downstream": "", "further_downstream_reason": ""}')
+
+        incident = self._make_incident()
+        state = InvestigationState()
+        leading = TrackedHypothesis(
+            id="h1", description="Dependency failure",
+            status=HypothesisStatus.INVESTIGATING, confidence=0.4,
+        )
+        state.hypotheses["h1"] = leading
+        trace = InvestigationTrace()
+        data = ObservabilityData()
+
+        initial = state.downstream_steps_taken
+        await depth._investigate_downstream_service(
+            "downstream-svc", "", incident, trace, state, data, leading, "dependency_failure",
+        )
+        # Should have continued past the empty first query
+        assert state.downstream_steps_taken - initial >= 2
+
+
+# ── Separate Budget Tests ────────────────────────────────────────────
+
+
+class TestSeparateDownstreamBudget:
+    """Tests for separate depth vs downstream budgets."""
+
+    @pytest.mark.asyncio
+    async def test_downstream_uses_separate_budget(self):
+        """Downstream investigation should use max_downstream_steps, not max_depth_steps."""
+        config = AgentConfig(max_depth_steps=3, max_downstream_steps=10)
+        dd = AsyncMock()
+        correlation = MagicMock()
+        executor = ActionExecutor(dd, correlation, config)
+        reasoning = MagicMock()
+        reasoning.query_dynamic = AsyncMock(return_value='{"is_source": true, "root_cause": "Crash", "mechanism": "OOM kill", "evidence_summary": "Pod crashed", "confidence_delta": 0.1, "further_downstream": "", "further_downstream_reason": "", "downstream_services": []}')
+        analysis = AnalysisPhase(reasoning, correlation, config)
+        depth = DepthPhase(executor, analysis, reasoning, config)
+
+        now = datetime.now(timezone.utc)
+        incident = IncidentQuery(
+            raw_query="Error spike",
+            service="my-svc",
+            symptom_type=SymptomType.ERROR_RATE,
+            start_time=now - timedelta(hours=1),
+            end_time=now,
+        )
+        state = InvestigationState()
+        leading = TrackedHypothesis(
+            id="h1", description="Downstream dependency timeout cascade",
+            status=HypothesisStatus.INVESTIGATING, confidence=0.4,
+            supporting_evidence=["from-service:caller to search-service:downstream-a"],
+        )
+        state.hypotheses["h1"] = leading
+        trace = InvestigationTrace()
+        data = ObservabilityData()
+
+        dd.search_traces = AsyncMock(return_value=[])
+        dd.search_logs = AsyncMock(return_value=[])
+        dd.query_metrics = AsyncMock(return_value=[])
+        dd.get_events = AsyncMock(return_value=[])
+        dd.get_triggered_monitors = AsyncMock(return_value=[])
+
+        await depth.run(incident, trace, state, data)
+
+        # downstream_steps_taken should be <= max_downstream_steps
+        assert state.downstream_steps_taken <= 10
+        # Standard depth queries should have run (trace-follow + 2 standard)
+        # even though max_depth_steps=3
+        assert state.depth_steps_taken >= 3
+
+
+# ── LLM Ranking Tests ───────────────────────────────────────────────
+
+
+class TestLLMRanking:
+    """Tests for LLM-based downstream service ranking."""
+
+    @pytest.mark.asyncio
+    async def test_ranking_reorders_services(self):
+        """LLM ranking should reorder services by root-cause likelihood."""
+        config = AgentConfig()
+        dd = AsyncMock()
+        correlation = MagicMock()
+        executor = ActionExecutor(dd, correlation, config)
+        reasoning = MagicMock()
+        analysis = AnalysisPhase(reasoning, correlation, config)
+        depth = DepthPhase(executor, analysis, reasoning, config)
+
+        now = datetime.now(timezone.utc)
+        incident = IncidentQuery(
+            raw_query="Error spike",
+            service="my-svc",
+            symptom_type=SymptomType.ERROR_RATE,
+            start_time=now - timedelta(hours=1),
+            end_time=now,
+        )
+        leading = TrackedHypothesis(
+            id="h1", description="Dependency failure causing errors",
+            status=HypothesisStatus.INVESTIGATING, confidence=0.5,
+            supporting_evidence=["SearchClient.GetItems failed with Internal error"],
+        )
+        data = ObservabilityData()
+
+        candidates = [
+            {"service_name": "campaign-svc", "source": "trace span", "likely_k8s_namespace": "", "investigation_priority": "high"},
+            {"service_name": "search-svc", "source": "trace span", "likely_k8s_namespace": "", "investigation_priority": "high"},
+            {"service_name": "comments-svc", "source": "trace span", "likely_k8s_namespace": "", "investigation_priority": "medium"},
+            {"service_name": "analytics-svc", "source": "trace span", "likely_k8s_namespace": "", "investigation_priority": "low"},
+        ]
+
+        # Claude ranks search-svc first (matches error pattern)
+        reasoning.query_dynamic = AsyncMock(return_value='{"ranked_services": [{"service_name": "search-svc", "reason": "SearchClient error points here"}, {"service_name": "campaign-svc", "reason": "Secondary"}]}')
+
+        ranked = await depth._rank_downstream_services(candidates, incident, leading, data)
+        assert ranked is not None
+        assert ranked[0]["service_name"] == "search-svc"
+        assert ranked[1]["service_name"] == "campaign-svc"
+
+    @pytest.mark.asyncio
+    async def test_ranking_fallback_on_parse_failure(self):
+        """LLM ranking should return None on parse failure, triggering fallback."""
+        config = AgentConfig()
+        dd = AsyncMock()
+        correlation = MagicMock()
+        executor = ActionExecutor(dd, correlation, config)
+        reasoning = MagicMock()
+        analysis = AnalysisPhase(reasoning, correlation, config)
+        depth = DepthPhase(executor, analysis, reasoning, config)
+
+        now = datetime.now(timezone.utc)
+        incident = IncidentQuery(
+            raw_query="Error spike",
+            service="my-svc",
+            symptom_type=SymptomType.ERROR_RATE,
+            start_time=now - timedelta(hours=1),
+            end_time=now,
+        )
+        leading = TrackedHypothesis(
+            id="h1", description="Dependency failure",
+            status=HypothesisStatus.INVESTIGATING, confidence=0.5,
+        )
+        data = ObservabilityData()
+
+        candidates = [
+            {"service_name": "svc-a", "source": "trace", "likely_k8s_namespace": "", "investigation_priority": "high"},
+            {"service_name": "svc-b", "source": "trace", "likely_k8s_namespace": "", "investigation_priority": "medium"},
+        ]
+
+        # Claude returns garbage
+        reasoning.query_dynamic = AsyncMock(return_value="not valid json at all")
+
+        ranked = await depth._rank_downstream_services(candidates, incident, leading, data)
+        assert ranked is None  # should fallback
+
+    @pytest.mark.asyncio
+    async def test_trace_tree_summary(self):
+        """Trace tree summary should show parent-child relationships."""
+        now = datetime.now(timezone.utc)
+        data = ObservabilityData()
+        data.traces = [
+            TraceSpan(
+                trace_id="t1", span_id="root", parent_id="",
+                service="home-jp", operation="grpc.server",
+                resource="/GetComponents", duration_ns=50_000_000,
+                start_time=now, status="error",
+            ),
+            TraceSpan(
+                trace_id="t1", span_id="child1", parent_id="root",
+                service="search-adapter", operation="grpc.client",
+                resource="SearchComponents", duration_ns=40_000_000,
+                start_time=now, status="error",
+            ),
+            TraceSpan(
+                trace_id="t1", span_id="child2", parent_id="root",
+                service="campaign-jp", operation="grpc.client",
+                resource="GetCampaigns", duration_ns=20_000_000,
+                start_time=now, status="ok",
+            ),
+        ]
+
+        result = DepthPhase._build_trace_tree_summary(data, "home-jp")
+        assert "home-jp" in result
+        assert "search-adapter" in result
+        assert "campaign-jp" in result
+        assert "Trace t1" in result

@@ -21,6 +21,7 @@ from src.claude.prompts import (
     DEPTH_ANALYSIS_PROMPT,
     DOWNSTREAM_DEPTH_PROMPT,
     DOWNSTREAM_EXTRACTION_PROMPT,
+    DOWNSTREAM_RANKING_PROMPT,
 )
 from src.claude.reasoning import ClaudeReasoning
 from src.investigation.analysis import AnalysisPhase
@@ -170,16 +171,25 @@ class DepthPhase:
     ) -> None:
         """Follow the dependency chain to downstream services.
 
-        1. Extract downstream services from evidence
-        2. Investigate each downstream service
-        3. Follow further downstream if needed
+        1. Follow trace IDs to discover actual downstream service names
+        2. Extract additional services from evidence
+        3. Investigate each downstream service
+        4. Follow further downstream if needed
         """
-        # First run the standard dependency_failure queries
+        # Step 1: Follow trace IDs to discover downstream services
+        # Client-side spans (service=mercari-home-jp) don't reveal downstream
+        # service names. We need to look up ALL spans in the same traces to
+        # find server-side spans from the actual downstream services.
+        trace_discovered = await self._follow_trace_ids(
+            incident, trace, state, accumulated_data, leading,
+        )
+
+        # Step 2: Run standard dependency_failure queries
         await self._run_standard_depth(
             incident, trace, state, accumulated_data, leading, category,
         )
 
-        # Extract downstream services from evidence
+        # Step 3: Extract downstream services from trace-following + evidence
         downstream_services = await self._identify_downstream_services(
             incident, state, leading, accumulated_data,
         )
@@ -201,8 +211,8 @@ class DepthPhase:
                 continue
             investigated.add(svc_name)
 
-            if state.depth_steps_taken >= self.config.max_depth_steps:
-                logger.info("Depth phase: max depth steps reached, stopping")
+            if state.downstream_steps_taken >= self.config.max_downstream_steps:
+                logger.info("Depth phase: max downstream steps reached, stopping")
                 break
 
             logger.info(
@@ -227,6 +237,118 @@ class DepthPhase:
                 })
                 hop += 1
 
+    async def _follow_trace_ids(
+        self,
+        incident: IncidentQuery,
+        trace: InvestigationTrace,
+        state: InvestigationState,
+        accumulated_data: ObservabilityData,
+        leading: TrackedHypothesis,
+    ) -> list[str]:
+        """Follow trace IDs from error spans to discover downstream services.
+
+        Client-side spans all have service=<primary_service>. To find the actual
+        downstream services, we search for ALL spans sharing the same trace_id.
+        The server-side spans will have different service names — those are the
+        real downstream services.
+
+        Returns list of discovered service names.
+        """
+        # Collect unique trace IDs from error spans
+        error_trace_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for span in accumulated_data.traces:
+            if span.status == "error" and span.trace_id and span.trace_id not in seen_ids:
+                seen_ids.add(span.trace_id)
+                error_trace_ids.append(span.trace_id)
+
+        if not error_trace_ids:
+            logger.info("Depth phase: no error trace IDs to follow")
+            return []
+
+        # Search for all spans in these traces (up to 5 trace IDs to limit API calls)
+        trace_ids_to_follow = error_trace_ids[:5]
+        logger.info(
+            "Depth phase: following %d error trace IDs to discover downstream services",
+            len(trace_ids_to_follow),
+        )
+
+        step_start = time.monotonic()
+        step_number = trace.total_steps + 1
+        state.depth_steps_taken += 1
+
+        # Build query: trace_id:X OR trace_id:Y (search for all spans in these traces)
+        trace_id_query = " OR ".join(f"trace_id:{tid}" for tid in trace_ids_to_follow)
+        query = f"({trace_id_query}) -service:{incident.service}"
+
+        all_spans = []
+        try:
+            all_spans = await self.executor.dd_client.search_traces(
+                query, incident.start_time, incident.end_time, limit=500,
+            )
+        except Exception as e:
+            logger.warning("Trace ID follow-up failed: %s", e)
+
+        # Merge discovered spans into accumulated data
+        if all_spans:
+            merge_data(accumulated_data, all_spans, InvestigationActionType.FETCH_TRACES)
+
+        # Extract unique downstream service names
+        discovered_services: dict[str, str] = {}
+        for span in all_spans:
+            if span.service and span.service != incident.service:
+                if span.service not in discovered_services:
+                    status = "error" if span.status == "error" else "ok"
+                    discovered_services[span.service] = status
+
+        data_summary = (
+            f"{len(all_spans)} spans from {len(discovered_services)} downstream services"
+        )
+        svc_list = [
+            f"{svc} ({'ERROR' if status == 'error' else 'ok'})"
+            for svc, status in discovered_services.items()
+        ]
+
+        step = InvestigationStep(
+            step_number=step_number,
+            action=InvestigationActionType.FETCH_TRACES,
+            reason=f"[DEPTH:trace-follow] Following {len(trace_ids_to_follow)} error trace IDs to discover downstream services in the call chain",
+            data_source=incident.service,
+            query_params={"query": query, "depth_signal": "trace_id_follow"},
+            data_summary=data_summary,
+            findings=f"Discovered {len(discovered_services)} downstream services: {', '.join(svc_list)}" if discovered_services else "No downstream spans found in traced requests",
+            confidence=leading.confidence,
+        )
+        step.hypotheses = [
+            f"[{leading.status.value.upper()}] {leading.description} ({leading.confidence:.0%})"
+        ]
+        step.decision = "Follow distributed traces to find downstream service names"
+        step.duration_ms = int((time.monotonic() - step_start) * 1000)
+
+        trace.steps.append(step)
+        trace.total_steps += 1
+
+        if self.on_step_complete:
+            try:
+                await self.on_step_complete(step)
+            except Exception as e:
+                logger.warning("Depth step callback failed: %s", e)
+
+        if discovered_services:
+            logger.info(
+                "Depth phase: trace-follow discovered %d downstream services: %s",
+                len(discovered_services), list(discovered_services.keys()),
+            )
+            # Add as supporting evidence
+            leading.supporting_evidence.append(
+                f"[depth:trace-follow] Distributed trace analysis revealed {len(discovered_services)} "
+                f"downstream services in the call chain: {', '.join(svc_list)}"
+            )
+        else:
+            logger.info("Depth phase: trace-follow found no downstream spans")
+
+        return list(discovered_services.keys())
+
     async def _identify_downstream_services(
         self,
         incident: IncidentQuery,
@@ -238,9 +360,9 @@ class DepthPhase:
 
         Uses both pattern matching (fast) and Claude analysis (thorough).
         """
-        # Fast path: extract service names from evidence strings using patterns
+        # Fast path: extract service names from evidence strings and trace spans
         services_from_patterns = self._extract_services_from_evidence(
-            leading, state, incident,
+            leading, state, incident, accumulated_data,
         )
 
         if services_from_patterns:
@@ -297,11 +419,198 @@ class DepthPhase:
                 merged[svc["service_name"]] = svc
 
         all_services = list(merged.values())
-        # Sort by priority: high first
+        # Sort by priority: high first (fallback ordering)
         priority_order = {"high": 0, "medium": 1, "low": 2}
         all_services.sort(key=lambda s: priority_order.get(s.get("investigation_priority", "low"), 2))
 
+        # Use LLM ranking when we have enough candidates to benefit
+        if len(all_services) > 3:
+            ranked = await self._rank_downstream_services(
+                all_services, incident, leading, accumulated_data,
+            )
+            if ranked:
+                return ranked
+
         return all_services[:5]
+
+    async def _rank_downstream_services(
+        self,
+        candidates: list[dict],
+        incident: IncidentQuery,
+        leading: TrackedHypothesis,
+        accumulated_data: ObservabilityData,
+    ) -> Optional[list[dict]]:
+        """Ask Claude to rank downstream services by root-cause likelihood.
+
+        Returns ranked list of service dicts, or None on failure (caller falls back).
+        """
+        trace_tree = self._build_trace_tree_summary(accumulated_data, incident.service)
+        candidates_text = self._build_candidates_summary(candidates, accumulated_data)
+
+        # Collect error messages from hypothesis evidence
+        error_messages = "\n".join(
+            e[:300] for e in leading.supporting_evidence[:5]
+        ) or "No error patterns identified yet"
+
+        prompt = DOWNSTREAM_RANKING_PROMPT.format(
+            service=incident.service,
+            hypothesis=leading.description,
+            error_messages=error_messages,
+            candidates=candidates_text,
+            trace_tree=trace_tree,
+        )
+
+        try:
+            response = await self.reasoning.query_dynamic(prompt)
+            result = parse_json_response(response, fallback={"ranked_services": []})
+            ranked_names = [
+                s["service_name"] for s in result.get("ranked_services", [])
+                if s.get("service_name")
+            ]
+        except Exception as e:
+            logger.warning("LLM ranking failed: %s", e)
+            return None
+
+        if not ranked_names:
+            return None
+
+        # Map ranked names back to original candidate dicts
+        candidates_by_name = {c["service_name"]: c for c in candidates}
+        ranked = []
+        for name in ranked_names[:5]:
+            if name in candidates_by_name:
+                ranked.append(candidates_by_name[name])
+            else:
+                # Claude may have returned a name not in our list — skip it
+                logger.debug("LLM ranked unknown service '%s', skipping", name)
+
+        if ranked:
+            logger.info(
+                "Depth phase: LLM ranked services: %s",
+                [s["service_name"] for s in ranked],
+            )
+
+        return ranked if ranked else None
+
+    @staticmethod
+    def _build_trace_tree_summary(
+        accumulated_data: ObservabilityData,
+        incident_service: str,
+    ) -> str:
+        """Build a compact tree showing request flow from distributed traces.
+
+        Groups spans by trace_id, builds parent-child trees, returns text.
+        Focuses on error traces to show the failure path.
+        """
+        if not accumulated_data.traces:
+            return "No trace data available"
+
+        # Group spans by trace_id, prioritize error traces
+        traces_by_id: dict[str, list] = {}
+        for span in accumulated_data.traces:
+            if span.trace_id:
+                traces_by_id.setdefault(span.trace_id, []).append(span)
+
+        # Pick up to 3 traces that contain errors
+        error_trace_ids = [
+            tid for tid, spans in traces_by_id.items()
+            if any(s.status == "error" for s in spans)
+        ][:3]
+
+        if not error_trace_ids:
+            error_trace_ids = list(traces_by_id.keys())[:2]
+
+        lines = []
+        for tid in error_trace_ids:
+            spans = traces_by_id[tid]
+            # Build parent-child map
+            by_span_id: dict[str, Any] = {}
+            roots: list = []
+            for span in spans:
+                by_span_id[span.span_id] = span
+            for span in spans:
+                if not span.parent_id or span.parent_id not in by_span_id:
+                    roots.append(span)
+
+            lines.append(f"Trace {tid[:12]}...:")
+
+            def _render_span(sp, depth=1):
+                prefix = "  " * depth
+                error_str = f", {sp.status}" if sp.status == "error" else ""
+                handling = ""
+                if sp.meta.get("error.handling") == "handled":
+                    handling = " [handled]"
+                dur = f"{sp.duration_ns / 1e6:.0f}ms" if sp.duration_ns else "?"
+                lines.append(
+                    f"{prefix}{sp.service}: {sp.operation} {sp.resource[:60]} "
+                    f"({dur}{error_str}{handling})"
+                )
+                # Find children
+                children = [
+                    s for s in spans
+                    if s.parent_id == sp.span_id and s.span_id != sp.span_id
+                ]
+                for child in children[:5]:  # limit children per node
+                    _render_span(child, depth + 1)
+
+            for root in roots[:3]:  # limit roots per trace
+                _render_span(root)
+
+        result = "\n".join(lines)
+        return result[:2000] if len(result) > 2000 else result
+
+    @staticmethod
+    def _build_candidates_summary(
+        candidates: list[dict],
+        accumulated_data: ObservabilityData,
+    ) -> str:
+        """Format candidate services with trace status and operation info."""
+        # Build a map of service -> trace info from spans
+        svc_info: dict[str, dict] = {}
+        for span in accumulated_data.traces:
+            if span.service and span.service not in svc_info:
+                handling = span.meta.get("error.handling", "")
+                svc_info[span.service] = {
+                    "operation": span.operation,
+                    "resource": span.resource[:60] if span.resource else "",
+                    "status": span.status,
+                    "error_msg": span.error_message[:80] if span.error_message else "",
+                    "handling": handling,
+                }
+            elif span.service and span.status == "error":
+                # Prefer error spans for the summary
+                handling = span.meta.get("error.handling", "")
+                svc_info[span.service] = {
+                    "operation": span.operation,
+                    "resource": span.resource[:60] if span.resource else "",
+                    "status": "error",
+                    "error_msg": span.error_message[:80] if span.error_message else "",
+                    "handling": handling,
+                }
+
+        lines = []
+        for c in candidates:
+            name = c["service_name"]
+            info = svc_info.get(name, {})
+            status = info.get("status", "unknown").upper()
+            op = info.get("operation", "")
+            err = info.get("error_msg", "")
+            handling = info.get("handling", "")
+            source = c.get("source", "unknown")
+
+            parts = [f"- {name} [{status}]"]
+            if op:
+                parts.append(f"(operation: {op}")
+                if err:
+                    parts.append(f", error: {err}")
+                if handling:
+                    parts.append(f", {handling}")
+                parts.append(f", source: {source})")
+            else:
+                parts.append(f"(source: {source})")
+            lines.append("".join(parts))
+
+        return "\n".join(lines)
 
     # Common English words that regex might accidentally extract as service names
     _NOT_SERVICE_NAMES = frozenset({
@@ -327,6 +636,12 @@ class DepthPhase:
             return False
         if name.startswith("http"):
             return False
+        # Reject Go package paths (e.g., google.golang.org/grpc, net/http)
+        if "/" in name:
+            return False
+        # Reject domain-like names that are clearly not K8s services
+        if name.endswith(".org") or name.endswith(".com") or name.endswith(".io"):
+            return False
         # Real service names almost always contain a hyphen or underscore
         # or have a domain-like structure (e.g., mercari-searchx-jp)
         has_separator = "-" in name or "_" in name or "." in name
@@ -340,9 +655,39 @@ class DepthPhase:
         leading: TrackedHypothesis,
         state: InvestigationState,
         incident: IncidentQuery,
+        accumulated_data: Optional[ObservabilityData] = None,
     ) -> list[dict]:
-        """Extract service names from evidence using regex patterns."""
+        """Extract service names from evidence using regex patterns and trace spans."""
         services: dict[str, dict] = {}
+
+        # Extract from trace spans first — most reliable for finding downstream services
+        if accumulated_data and accumulated_data.traces:
+            for span in accumulated_data.traces:
+                # Each span's service field tells us which service processed it
+                if span.service and span.service != incident.service:
+                    if DepthPhase._is_valid_service_name(span.service, incident.service):
+                        priority = "high" if span.status == "error" else "medium"
+                        if span.service not in services or priority == "high":
+                            services[span.service] = {
+                                "service_name": span.service,
+                                "source": f"trace span (operation={span.operation}, status={span.status})",
+                                "likely_k8s_namespace": "",
+                                "investigation_priority": priority,
+                            }
+                # Check meta for peer_service, target_service, etc.
+                # NOTE: "component" is excluded — it contains Go library names
+                # (e.g., google.golang.org/grpc, net/http), not service names
+                for meta_key in ("peer.service", "peer_service", "target.service"):
+                    meta_val = span.meta.get(meta_key, "")
+                    if meta_val and meta_val != incident.service:
+                        if DepthPhase._is_valid_service_name(meta_val, incident.service):
+                            services.setdefault(meta_val, {
+                                "service_name": meta_val,
+                                "source": f"trace meta {meta_key}",
+                                "likely_k8s_namespace": "",
+                                "investigation_priority": "high",
+                            })
+
         all_evidence = (
             leading.supporting_evidence
             + leading.contradicting_evidence
@@ -460,13 +805,17 @@ class DepthPhase:
             downstream_service, namespace, incident,
         )
 
-        for query_spec in downstream_queries:
-            if state.depth_steps_taken >= self.config.max_depth_steps:
+        skip_remaining = False
+        for idx, query_spec in enumerate(downstream_queries):
+            if skip_remaining:
+                break
+            if state.downstream_steps_taken >= self.config.max_downstream_steps:
                 break
 
             step_start = time.monotonic()
             step_number = trace.total_steps + 1
-            state.depth_steps_taken += 1
+            state.downstream_steps_taken += 1
+            state.depth_steps_taken += 1  # keep total accurate for logging
 
             logger.info(
                 "Depth step (downstream %s): %s — %s",
@@ -487,6 +836,11 @@ class DepthPhase:
                         query_spec["query"], incident.start_time, incident.end_time,
                     )
                     data_summary = f"{len(raw_data) if isinstance(raw_data, list) else 0} log entries"
+                elif query_spec["type"] == "trace":
+                    raw_data = await self.executor.dd_client.search_traces(
+                        query_spec["query"], incident.start_time, incident.end_time,
+                    )
+                    data_summary = f"{len(raw_data) if isinstance(raw_data, list) else 0} trace spans"
                 elif query_spec["type"] == "event":
                     raw_data = await self.executor.dd_client.get_events(
                         incident.start_time, incident.end_time,
@@ -502,11 +856,20 @@ class DepthPhase:
                 logger.warning("Downstream query for %s failed: %s", downstream_service, e)
                 data_summary = f"Query failed: {e}"
 
+            action_type_map = {
+                "metric": InvestigationActionType.QUERY_CUSTOM_METRIC,
+                "log": InvestigationActionType.SEARCH_LOGS_CUSTOM,
+                "trace": InvestigationActionType.FETCH_TRACES,
+                "event": InvestigationActionType.FETCH_DEPLOYMENTS,
+                "monitors": InvestigationActionType.QUERY_CUSTOM_METRIC,
+            }
+            step_action = action_type_map.get(
+                query_spec["type"], InvestigationActionType.QUERY_CUSTOM_METRIC
+            )
+
             step = InvestigationStep(
                 step_number=step_number,
-                action=InvestigationActionType.QUERY_CUSTOM_METRIC
-                if query_spec["type"] == "metric"
-                else InvestigationActionType.SEARCH_LOGS_CUSTOM,
+                action=step_action,
                 reason=f"[DEPTH:downstream:{downstream_service}] {query_spec['description']}",
                 data_source=downstream_service,
                 query_params={"query": query_spec["query"], "depth_signal": query_spec["signal"]},
@@ -518,16 +881,10 @@ class DepthPhase:
                 step.findings = f"No data for {query_spec['signal']} on {downstream_service}"
                 step.confidence = leading.confidence
             else:
-                # Merge data using correct action type based on query type
-                merge_action = (
-                    InvestigationActionType.QUERY_CUSTOM_METRIC
-                    if query_spec["type"] == "metric"
-                    else InvestigationActionType.SEARCH_LOGS_CUSTOM
-                )
-                merge_data(accumulated_data, raw_data, merge_action)
+                merge_data(accumulated_data, raw_data, step_action)
 
                 # Analyze with downstream-specific prompt
-                data_content = format_raw_data(raw_data, merge_action)
+                data_content = format_raw_data(raw_data, step_action)
                 prompt = DOWNSTREAM_DEPTH_PROMPT.format(
                     upstream_service=incident.service,
                     downstream_service=downstream_service,
@@ -585,6 +942,28 @@ class DepthPhase:
                 if step.findings:
                     context += f"\n  (+) {step.findings[:200]}"
 
+                # Early exit: after first query, if service is a victim, skip remaining
+                if idx == 0:
+                    is_victim_source = result.get("is_source", False)
+                    if not is_victim_source:
+                        victim_mechanism = (result.get("mechanism", "") or "").lower()
+                        victim_indicators = [
+                            "context canceled", "context cancelled",
+                            "deadline exceeded", "circuit breaker",
+                            "graceful", "handled", "propagated from upstream",
+                            "victim", "not the source",
+                        ]
+                        if any(ind in victim_mechanism for ind in victim_indicators):
+                            logger.info(
+                                "Depth phase: %s is a victim (%s), skipping remaining queries",
+                                downstream_service, victim_mechanism[:80],
+                            )
+                            leading.contradicting_evidence.append(
+                                f"[depth:downstream:{downstream_service}:early-exit] "
+                                f"Service is a victim, not a source: {victim_mechanism[:150]}"
+                            )
+                            skip_remaining = True
+
             step.hypotheses = [
                 f"[{leading.status.value.upper()}] {leading.description} ({leading.confidence:.0%})"
             ]
@@ -616,11 +995,21 @@ class DepthPhase:
         """Build investigation queries for a downstream service.
 
         These queries investigate the downstream service's health directly:
-        error logs, pod restarts, latency, resource usage, and events.
+        traces (critical for following dependency chains), error logs, pod restarts,
+        latency, resource usage, and events.
         """
         queries = []
 
-        # 1. Error logs from the downstream service
+        # 1. Traces from/to the downstream service — MOST IMPORTANT
+        # This is how we follow the dependency chain further downstream
+        queries.append({
+            "type": "trace",
+            "query": f"service:{service} status:error",
+            "signal": f"{service}_error_traces",
+            "description": f"Error traces from downstream service {service} (reveals further downstream dependencies)",
+        })
+
+        # 2. Error logs from the downstream service
         log_query = f"service:{service} status:error"
         if namespace:
             log_query = f"(service:{service} OR kube_namespace:{namespace}) status:error"
@@ -629,14 +1018,6 @@ class DepthPhase:
             "query": log_query,
             "signal": f"{service}_error_logs",
             "description": f"Error logs from downstream service {service}",
-        })
-
-        # 2. Error logs mentioning the downstream service from any source
-        queries.append({
-            "type": "log",
-            "query": f"*{service}* (error OR timeout OR unavailable OR SIGTERM OR OOMKilled OR restart)",
-            "signal": f"{service}_mentions",
-            "description": f"Log mentions of {service} with error/timeout/restart keywords",
         })
 
         # 3. Pod restarts / termination for the downstream service
@@ -818,6 +1199,26 @@ class DepthPhase:
     ) -> str:
         """Collect raw data samples for downstream extraction prompt."""
         samples = []
+
+        # Trace spans — most valuable for identifying downstream services
+        for span in accumulated_data.traces[:20]:
+            meta_str = ""
+            if span.meta:
+                # Include key meta fields that may contain service names
+                relevant_keys = [
+                    k for k in span.meta
+                    if any(t in k.lower() for t in ["service", "peer", "target", "component", "error"])
+                ]
+                if relevant_keys:
+                    meta_str = " meta={" + ", ".join(f"{k}:{span.meta[k]}" for k in relevant_keys[:5]) + "}"
+            error_str = ""
+            if span.error_message:
+                error_str = f" error='{span.error_message[:150]}'"
+            samples.append(
+                f"trace: service={span.service} operation={span.operation} "
+                f"resource={span.resource} status={span.status} "
+                f"duration={span.duration_ns/1e6:.0f}ms{error_str}{meta_str}"
+            )
 
         # Metric names and tags
         for m in accumulated_data.metrics[:10]:

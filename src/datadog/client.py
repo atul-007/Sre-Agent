@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
@@ -480,14 +480,7 @@ class DatadogClient:
             top_error = attrs.get("error", {})
 
             # Parse start_timestamp (ISO 8601 string like "2026-04-01T05:57:04.208Z")
-            start_ts_str = attrs.get("start_timestamp", "")
-            if start_ts_str:
-                try:
-                    start_ts = datetime.fromisoformat(start_ts_str.replace("Z", "+00:00"))
-                except (ValueError, TypeError):
-                    start_ts = datetime.now(timezone.utc)
-            else:
-                start_ts = datetime.now(timezone.utc)
+            start_ts = safe_fromisoformat(attrs.get("start_timestamp", ""))
 
             # Build meta dict from custom fields (excluding large nested objects)
             meta: dict[str, str] = {}

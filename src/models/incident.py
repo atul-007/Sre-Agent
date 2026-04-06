@@ -230,9 +230,11 @@ class InvestigationState(BaseModel):
     # v3 additions
     data_gaps: list[DataGap] = Field(default_factory=list)
     depth_steps_taken: int = 0
+    downstream_steps_taken: int = 0
     investigation_start_time: Optional[datetime] = None
     phase: str = "discovery"  # discovery|breadth|depth|concluding
     changes_detected: list[dict[str, Any]] = Field(default_factory=list)
+    symptom_type: str = ""  # e.g. "error_rate", "latency" — for conclusion guards
 
 
 class InvestigationActionType(str, Enum):

@@ -341,9 +341,34 @@ def can_conclude(
     if not has_evidence and state.hypotheses:
         return False, "No hypothesis has any evidence yet"
 
-    # v3: If leading hypothesis involves a dependency failure, require traces
-    # to be checked before concluding — traces are essential for following
-    # the request flow through downstream services.
+    # v3: For error_rate and latency investigations, ALWAYS require traces and
+    # dependencies to be checked before concluding. These signals are critical
+    # for following the request flow through downstream services. Without them,
+    # the agent can falsely conclude "no issue" or miss cascading failures.
+    symptom = state.symptom_type if hasattr(state, "symptom_type") else ""
+    symptom_str = symptom.value if hasattr(symptom, "value") else str(symptom)
+    trace_required_symptoms = {
+        SymptomType.ERROR_RATE.value,
+        SymptomType.LATENCY.value,
+        SymptomType.AVAILABILITY.value,
+    }
+    if symptom_str in trace_required_symptoms:
+        traces_signal = checklist.get("traces")
+        deps_signal = checklist.get("dependencies")
+        missing = []
+        if traces_signal and not traces_signal.checked:
+            missing.append("traces")
+        if deps_signal and not deps_signal.checked:
+            missing.append("dependencies")
+        if missing:
+            return False, (
+                f"Cannot conclude {symptom_str} investigation without checking "
+                f"{', '.join(missing)}. These signals are critical for identifying "
+                f"cascading failures and downstream service issues."
+            )
+
+    # Also block conclusion if leading hypothesis involves dependency keywords,
+    # even for symptom types not in the list above.
     leading = _get_leading_hypothesis(state.hypotheses) if state.hypotheses else None
     if leading:
         dep_keywords = {
@@ -483,7 +508,10 @@ DEPTH_QUERIES: dict[str, dict] = {
         "description": "Upstream or downstream service causing issues",
         "keywords": [
             "upstream", "downstream", "dependency", "external", "timeout",
-            "connection", "circuit breaker", "retry storm", "cascade",
+            "connection", "circuit breaker", "retry storm", "cascad",
+            "context cancel", "failing internally", "service failure",
+            "unavailable", "failed to get", "rpc error", "internal error",
+            "grpc", "getcomponents", "failed to call",
         ],
         "queries": [
             {

@@ -25,8 +25,14 @@ def safe_timestamp(epoch_seconds: float) -> datetime:
 def safe_fromisoformat(iso_str: str) -> datetime:
     """Parse an ISO format string into a UTC-aware datetime.
 
-    Handles trailing 'Z', missing timezone, etc.
+    Handles trailing 'Z', missing timezone, empty/invalid strings, etc.
+    Returns current UTC time if parsing fails.
     """
-    cleaned = iso_str.replace("Z", "+00:00")
-    dt = datetime.fromisoformat(cleaned)
-    return ensure_utc(dt)
+    if not iso_str:
+        return datetime.now(timezone.utc)
+    try:
+        cleaned = iso_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
+        return ensure_utc(dt)
+    except (ValueError, TypeError, AttributeError):
+        return datetime.now(timezone.utc)

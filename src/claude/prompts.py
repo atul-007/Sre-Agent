@@ -382,15 +382,20 @@ downstream services that should be investigated next.
 **Evidence collected so far:**
 {evidence}
 
-**Raw data samples (metric names, log entries, tags):**
+**Raw data samples (trace spans, metric names, log entries, tags):**
 {raw_data_samples}
 
 Extract any downstream or dependency service names mentioned in the evidence. Look for:
+- **Trace span service names** — each span's `service` field identifies which service handled it. Services different from {service} are downstream dependencies. This is the MOST RELIABLE source.
+- **Trace span meta fields** — peer.service, peer_service, target.service fields in trace meta
+- **Trace span resource names** — resource field may contain RPC method names that hint at target services
 - Service names in circuit breaker tags (from-service, search-service, peer_service)
 - Service names in error messages (connection to X failed, timeout calling Y)
 - Service names in metric tags (downstream_service, target_service)
 - gRPC service names that map to Kubernetes deployments
 - Kubernetes service endpoints mentioned in logs
+
+IMPORTANT: Prioritize services found in trace spans over services found in logs. Trace spans directly show the request flow.
 
 Respond in JSON:
 {{
@@ -403,6 +408,44 @@ Respond in JSON:
         }}
     ],
     "reasoning": "<why these services are relevant>"
+}}"""
+
+
+DOWNSTREAM_RANKING_PROMPT = """You are triaging downstream services to determine investigation \
+order for a production incident root cause analysis.
+
+**Primary service:** {service}
+**Leading hypothesis:** {hypothesis}
+
+**Primary service error patterns (from investigation so far):**
+{error_messages}
+
+**Candidate downstream services (from distributed trace analysis):**
+{candidates}
+
+**Request flow (from distributed traces):**
+{trace_tree}
+
+Rank the top 5 services most likely to be the ROOT CAUSE (not victims of upstream failures).
+
+Ranking criteria:
+1. Services in the CRITICAL REQUEST PATH — the path that produced the user-facing error — rank \
+highest. Match service names against error messages from the primary service.
+2. Services with UNHANDLED errors (Internal, Unavailable, crashes) rank above those with graceful \
+degradation (context canceled, handled NotFound).
+3. Services whose failure EXPLAINS the primary symptoms. If the primary service errors mention \
+"SearchClient failed" or "GetComponents Internal error", search-related services rank higher.
+4. Infrastructure services (redis, mysql, datastore) rank lower than application services unless \
+they show clear errors.
+
+Return ONLY a JSON object:
+{{
+    "ranked_services": [
+        {{
+            "service_name": "<exact service name from candidates list>",
+            "reason": "<1-2 sentences: why this service is likely closer to root cause>"
+        }}
+    ]
 }}"""
 
 

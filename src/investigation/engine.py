@@ -76,6 +76,7 @@ class InvestigationEngine:
             signal_checklist=build_signal_checklist(incident.symptom_type.value),
             investigation_start_time=datetime.now(timezone.utc),
             phase="discovery",
+            symptom_type=incident.symptom_type.value,
         )
 
         logger.info("Starting v3 investigation for %s", incident.service)
