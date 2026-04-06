@@ -153,10 +153,20 @@ def _extract_tags_from_alert(text: str) -> dict[str, str]:
 
 
 def _extract_monitor_id(text: str) -> int | None:
-    """Extract monitor ID from a Datadog monitor URL."""
-    match = re.search(r"monitors/(\d+)", text)
-    if match:
-        return int(match.group(1))
+    """Extract monitor ID from a Datadog monitor URL or alert text.
+
+    Handles:
+      - monitors/12345 (URL path)
+      - monitors#12345 (URL fragment)
+      - Monitor #12345 or Monitor ID: 12345 (alert text)
+    """
+    for pattern in [
+        r"monitors[/#](\d+)",
+        r"[Mm]onitor\s*#?\s*(?:ID:?\s*)?(\d{4,})",
+    ]:
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1))
     return None
 
 
