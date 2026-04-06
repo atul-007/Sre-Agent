@@ -60,6 +60,10 @@ class SREAgent:
             incident.end_time,
         )
 
+        # Enrich with monitor definition if monitor_id was extracted from the alert
+        if incident.monitor_id and not incident.additional_context:
+            incident = await self._enrich_with_monitor(incident)
+
         return await self.investigate_from_incident(incident)
 
     async def investigate_from_incident(
@@ -147,6 +151,50 @@ class SREAgent:
             return self.formatter.to_compact(report)
         else:
             return self.formatter.to_markdown(report)
+
+    async def _enrich_with_monitor(self, incident: IncidentQuery) -> IncidentQuery:
+        """Fetch monitor definition from Datadog and enrich the incident query.
+
+        Adds monitor name, exact query, thresholds, and tags to additional_context
+        so the investigation has full visibility into what triggered the alert.
+        """
+        try:
+            async with self.dd_client:
+                monitor_def = await self.dd_client.get_monitor(incident.monitor_id)
+        except Exception as e:
+            logger.warning("Failed to fetch monitor %d: %s", incident.monitor_id, e)
+            return incident
+
+        monitor_name = monitor_def.get("name", "")
+        monitor_query = monitor_def.get("query", "")
+        monitor_tags = monitor_def.get("tags", [])
+        thresholds = monitor_def.get("options", {}).get("thresholds", {})
+        monitor_message = monitor_def.get("message", "")
+
+        logger.info("Fetched monitor %d: %s", incident.monitor_id, monitor_name)
+        logger.info("Monitor query: %s", monitor_query)
+
+        context_parts = []
+        if monitor_name:
+            context_parts.append(f"Monitor name: {monitor_name}")
+        if monitor_query:
+            context_parts.append(f"Monitor query: {monitor_query}")
+        if thresholds:
+            context_parts.append(f"Thresholds: {thresholds}")
+        if monitor_tags:
+            context_parts.append(f"Monitor tags: {', '.join(monitor_tags)}")
+        if monitor_message:
+            # Truncate long messages (often contain Slack formatting/runbook links)
+            context_parts.append(f"Monitor message: {monitor_message[:500]}")
+
+        updated = incident.model_copy(
+            update={
+                "additional_context": "\n".join(context_parts),
+                "monitor_query": monitor_query or incident.monitor_query,
+            }
+        )
+
+        return updated
 
     async def close(self) -> None:
         await self.dd_client.close()
