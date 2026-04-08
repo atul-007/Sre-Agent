@@ -159,8 +159,7 @@ class SREAgent:
         so the investigation has full visibility into what triggered the alert.
         """
         try:
-            async with self.dd_client:
-                monitor_def = await self.dd_client.get_monitor(incident.monitor_id)
+            monitor_def = await self.dd_client.get_monitor(incident.monitor_id)
         except Exception as e:
             logger.warning("Failed to fetch monitor %d: %s", incident.monitor_id, e)
             return incident
