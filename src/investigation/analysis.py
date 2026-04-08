@@ -257,8 +257,16 @@ class AnalysisPhase:
                         h.confidence = min(max(float(update["confidence"]), 0.0), 1.0)
                     if description and len(description) > len(h.description):
                         h.description = description
-                    h.supporting_evidence.extend(update.get("supporting_evidence", []))
-                    h.contradicting_evidence.extend(update.get("contradicting_evidence", []))
+                    existing_support = set(h.supporting_evidence)
+                    for e in update.get("supporting_evidence", []):
+                        if e not in existing_support:
+                            h.supporting_evidence.append(e)
+                            existing_support.add(e)
+                    existing_contra = set(h.contradicting_evidence)
+                    for e in update.get("contradicting_evidence", []):
+                        if e not in existing_contra:
+                            h.contradicting_evidence.append(e)
+                            existing_contra.add(e)
                     h.last_updated_step = step_number
                 else:
                     new_id = self._next_hypothesis_id(state)

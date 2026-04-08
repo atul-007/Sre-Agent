@@ -281,7 +281,10 @@ Analyze this data and provide:
 6. How confident are you now in the root cause? (0.0 = no idea, 1.0 = certain)
 
 IMPORTANT confidence rules:
-- If >50% of data sources returned empty, confidence MUST be < 0.40
+- Empty/missing data should NOT decrease confidence from previous steps. Empty data means \
+"not checked", not "contradicts hypothesis". Only lower confidence if new data actively \
+contradicts your hypothesis.
+- If ALL data sources returned empty and you have no evidence at all, confidence should be < 0.20
 - Only set confidence > 0.80 if you have strong, direct evidence (not just inference)
 - If root cause is based on absence of data, mark it INCONCLUSIVE, not CONFIRMED
 

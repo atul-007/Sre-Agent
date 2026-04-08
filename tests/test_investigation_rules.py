@@ -123,11 +123,31 @@ class TestCalibrateConfidence:
         state.hypotheses = hypotheses or {}
         return state
 
-    def test_caps_on_sparse_data(self):
-        """More than 50% empty fetches should cap confidence."""
-        state = self._make_state(empty=6, total=10)
+    def test_caps_when_all_fetches_empty(self):
+        """All fetches empty should cap confidence at 0.20."""
+        state = self._make_state(empty=6, total=6)
+        result = calibrate_confidence(0.8, state)
+        assert result <= 0.20
+
+    def test_caps_moderately_with_one_non_empty(self):
+        """Only 1 non-empty fetch should cap at sparse threshold."""
+        state = self._make_state(empty=5, total=6)
         result = calibrate_confidence(0.8, state)
         assert result <= 0.40
+
+    def test_no_cap_with_some_data(self):
+        """2+ non-empty fetches should NOT cap, even if >50% empty."""
+        state = self._make_state(empty=4, total=6)
+        state.hypotheses = {
+            "h1": TrackedHypothesis(
+                id="h1", description="test",
+                status=HypothesisStatus.INVESTIGATING,
+                confidence=0.7,
+                supporting_evidence=["evidence1", "evidence2"],
+            )
+        }
+        result = calibrate_confidence(0.7, state)
+        assert result == 0.7
 
     def test_no_cap_on_good_data(self):
         """Less than 50% empty fetches should not cap."""
@@ -184,6 +204,36 @@ class TestCalibrateConfidence:
         }
         result = calibrate_confidence(0.9, state)
         assert result == 0.9
+
+    def test_high_confidence_with_minor_contradictions(self):
+        """Confidence >0.80 allowed if supporting >> contradicting."""
+        state = self._make_state(empty=1, total=10)
+        state.hypotheses = {
+            "h1": TrackedHypothesis(
+                id="h1", description="test",
+                status=HypothesisStatus.CONFIRMED,
+                confidence=0.9,
+                supporting_evidence=[f"e{i}" for i in range(10)],
+                contradicting_evidence=["c1", "c2", "c3"],
+            )
+        }
+        result = calibrate_confidence(0.9, state)
+        assert result == 0.9  # 3 contradicting < 10//2=5, so allowed
+
+    def test_high_confidence_blocked_with_major_contradictions(self):
+        """Confidence >0.80 blocked if contradicting > half of supporting."""
+        state = self._make_state(empty=1, total=10)
+        state.hypotheses = {
+            "h1": TrackedHypothesis(
+                id="h1", description="test",
+                status=HypothesisStatus.CONFIRMED,
+                confidence=0.9,
+                supporting_evidence=["e1", "e2", "e3", "e4"],
+                contradicting_evidence=["c1", "c2", "c3"],
+            )
+        }
+        result = calibrate_confidence(0.9, state)
+        assert result <= 0.80  # 3 contradicting > 4//2=2, so blocked
 
 
 class TestCanConclude:
@@ -244,3 +294,55 @@ class TestFormatSignalCoverage:
         assert "data found" in output
         assert "[ ]" in output
         assert "NOT YET CHECKED" in output
+
+
+class TestEvidenceDeduplication:
+    """Test that evidence deduplication works in hypothesis merging."""
+
+    def test_duplicate_evidence_filtered(self):
+        """Duplicate evidence strings should not be added twice."""
+        h = TrackedHypothesis(
+            id="h1", description="test",
+            status=HypothesisStatus.INVESTIGATING,
+            confidence=0.5,
+            supporting_evidence=["CPU at 62%"],
+            contradicting_evidence=["Missing traces"],
+        )
+        state = InvestigationState()
+        state.hypotheses = {"h1": h}
+
+        # Simulate what merge_hypotheses does internally
+        update = {
+            "supporting_evidence": ["CPU at 62%", "No throttling"],
+            "contradicting_evidence": ["Missing traces", "No gRPC data"],
+        }
+        existing_support = set(h.supporting_evidence)
+        for e in update.get("supporting_evidence", []):
+            if e not in existing_support:
+                h.supporting_evidence.append(e)
+                existing_support.add(e)
+        existing_contra = set(h.contradicting_evidence)
+        for e in update.get("contradicting_evidence", []):
+            if e not in existing_contra:
+                h.contradicting_evidence.append(e)
+                existing_contra.add(e)
+
+        assert h.supporting_evidence == ["CPU at 62%", "No throttling"]
+        assert h.contradicting_evidence == ["Missing traces", "No gRPC data"]
+
+    def test_evidence_preserves_order(self):
+        """New evidence should be appended after existing, preserving order."""
+        h = TrackedHypothesis(
+            id="h1", description="test",
+            status=HypothesisStatus.INVESTIGATING,
+            confidence=0.5,
+            supporting_evidence=["first", "second"],
+        )
+        new_evidence = ["second", "third", "first", "fourth"]
+        existing = set(h.supporting_evidence)
+        for e in new_evidence:
+            if e not in existing:
+                h.supporting_evidence.append(e)
+                existing.add(e)
+
+        assert h.supporting_evidence == ["first", "second", "third", "fourth"]

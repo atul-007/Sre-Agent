@@ -258,14 +258,23 @@ def calibrate_confidence(
     """
     calibrated = min(max(raw_confidence, 0.0), 1.0)
 
-    # Rule 1: Sparse data cap
+    # Rule 1: Sparse data cap — only penalize when we have NO data at all.
+    # Empty fetches mean "not checked", not "contradicts hypothesis".
     if state.total_fetches > 0:
-        empty_ratio = state.empty_fetches / state.total_fetches
-        if empty_ratio > 0.5:
+        non_empty = state.total_fetches - state.empty_fetches
+        if non_empty == 0:
+            # Zero evidence — cap very low
+            calibrated = min(calibrated, 0.20)
+            logger.debug(
+                "Confidence capped at 20%% (all %d fetches empty)",
+                state.total_fetches,
+            )
+        elif non_empty == 1:
+            # Only 1 data source — cap moderately
             calibrated = min(calibrated, confidence_cap_sparse)
             logger.debug(
-                "Confidence capped at %.0f%% (%.0f%% empty fetches)",
-                confidence_cap_sparse * 100, empty_ratio * 100,
+                "Confidence capped at %.0f%% (only 1 non-empty fetch)",
+                confidence_cap_sparse * 100,
             )
 
     # Rule 1b: Low data quality cap
@@ -288,12 +297,15 @@ def calibrate_confidence(
     if not has_direct_evidence:
         calibrated = min(calibrated, confidence_cap_no_evidence)
 
-    # Rule 3: High confidence gate
+    # Rule 3: High confidence gate — allow >0.80 if supporting evidence
+    # significantly outweighs contradicting evidence.
     if calibrated > 0.80:
         top_hyp = _get_leading_hypothesis(state.hypotheses)
         if top_hyp is None:
             calibrated = min(calibrated, 0.80)
-        elif len(top_hyp.supporting_evidence) < 2 or len(top_hyp.contradicting_evidence) > 0:
+        elif len(top_hyp.supporting_evidence) < 2:
+            calibrated = min(calibrated, 0.80)
+        elif len(top_hyp.contradicting_evidence) > len(top_hyp.supporting_evidence) // 2:
             calibrated = min(calibrated, 0.80)
 
     return calibrated
