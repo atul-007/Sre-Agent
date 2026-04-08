@@ -35,6 +35,7 @@ REQUIRED_SIGNALS: dict[str, list[str]] = {
     SymptomType.LATENCY.value: [
         "latency",
         "error_rate",
+        "error_logs",
         "request_rate",
         "cpu_usage",
         "memory",
@@ -197,9 +198,19 @@ def mark_signals_checked(
     step_number: int,
     data_found: bool,
     notes: str = "",
+    query: str = "",
 ) -> None:
-    """Mark all signals satisfied by this action as checked."""
+    """Mark all signals satisfied by this action as checked.
+
+    For query_custom_metric actions, infers which signals the query covers
+    based on the metric name in the query string.
+    """
     satisfied = ACTION_TO_SIGNALS.get(action_type, [])
+
+    # Infer signals from custom metric queries based on metric name
+    if action_type == InvestigationActionType.QUERY_CUSTOM_METRIC.value and query:
+        satisfied = list(satisfied) + _infer_signals_from_query(query)
+
     for sig in satisfied:
         if sig in checklist:
             checklist[sig].checked = True
@@ -419,6 +430,41 @@ def format_signal_coverage(checklist: dict[str, SignalCheckResult]) -> str:
 # ── Private helpers ───────────────────────────────────────────────────
 
 
+# ── Custom metric → signal inference ──────────────────────────────────
+
+# Patterns in metric names that map to signals
+_METRIC_SIGNAL_PATTERNS: list[tuple[list[str], list[str]]] = [
+    # Latency / duration metrics
+    (["latency", "duration", "response_time", "p50", "p75", "p95", "p99"], ["latency"]),
+    # Error metrics
+    (["error", "errors", "fault", "5xx", "4xx"], ["error_rate"]),
+    # Request rate / throughput
+    (["hits", "requests", "throughput", "count", "rate", "qps", "rps"], ["request_rate"]),
+    # CPU metrics
+    (["cpu.usage", "cpu.total", "cpu.system", "cpu.user"], ["cpu_usage"]),
+    # CPU throttling
+    (["throttl"], ["cpu_throttling"]),
+    # Memory
+    (["memory", "mem.usage", "heap", "rss"], ["memory"]),
+    # Trace-derived metrics (trace.* are aggregate metrics from APM, NOT actual trace spans).
+    # They provide latency/error/request data but do NOT satisfy the "traces" signal,
+    # which requires actual span-level data to follow request flows and identify downstream services.
+    (["trace."], ["latency", "error_rate", "request_rate"]),
+]
+
+
+def _infer_signals_from_query(query: str) -> list[str]:
+    """Infer which signals a custom metric query covers based on metric name patterns."""
+    query_lower = query.lower()
+    signals: list[str] = []
+    for patterns, signal_names in _METRIC_SIGNAL_PATTERNS:
+        for pattern in patterns:
+            if pattern in query_lower:
+                signals.extend(signal_names)
+                break
+    return list(set(signals))
+
+
 def _get_leading_hypothesis(
     hypotheses: dict[str, TrackedHypothesis],
 ) -> Optional[TrackedHypothesis]:
@@ -523,7 +569,10 @@ DEPTH_QUERIES: dict[str, dict] = {
             "connection", "circuit breaker", "retry storm", "cascad",
             "context cancel", "failing internally", "service failure",
             "unavailable", "failed to get", "rpc error", "internal error",
-            "grpc", "getcomponents", "failed to call",
+            "internal", "grpc", "getcomponents", "failed to call",
+            "resource constraint", "backend", "propagat", "deadline",
+            "latency.*depend", "depend.*latency", "error.*service",
+            "service.*error", "call.*fail", "fail.*call",
         ],
         "queries": [
             {
@@ -545,6 +594,7 @@ DEPTH_QUERIES: dict[str, dict] = {
         "keywords": [
             "oom", "memory", "disk", "exhaustion", "limit", "quota",
             "out of memory", "killed", "evict", "resource",
+            "saturat", "thread pool", "heap", "gc storm", "capacity",
         ],
         "queries": [
             {
@@ -600,7 +650,10 @@ DEPTH_QUERIES: dict[str, dict] = {
 def classify_hypothesis(description: str) -> str:
     """Match hypothesis description to a depth query category.
 
-    Returns the best-matching category key, or 'unknown' if no match.
+    Returns the best-matching category key, or 'dependency_failure' as fallback
+    when the description mentions any service/infrastructure issue but doesn't
+    match a specific category. This prevents the depth phase from being skipped
+    entirely on vague hypothesis descriptions.
     """
     import re as _re
 
@@ -617,7 +670,26 @@ def classify_hypothesis(description: str) -> str:
             best_score = score
             best_category = category
 
-    return best_category if best_score > 0 else "unknown"
+    if best_score > 0:
+        return best_category
+
+    # Fallback: if the hypothesis mentions anything infrastructure-related,
+    # default to dependency_failure so depth phase still runs and traces
+    # can be followed to downstream services.
+    infra_hints = [
+        "service", "latency", "error", "failure", "issue", "spike",
+        "degrad", "slow", "impact", "incident", "constraint", "bottleneck",
+        "overload", "pressure", "contention", "starv",
+    ]
+    if any(hint in desc_lower for hint in infra_hints):
+        logger.info(
+            "classify_hypothesis: no keyword match for '%s', "
+            "falling back to 'dependency_failure' (infra hint detected)",
+            description[:80],
+        )
+        return "dependency_failure"
+
+    return "unknown"
 
 
 def build_depth_queries(

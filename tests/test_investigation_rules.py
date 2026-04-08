@@ -346,3 +346,84 @@ class TestEvidenceDeduplication:
                 existing.add(e)
 
         assert h.supporting_evidence == ["first", "second", "third", "fourth"]
+
+
+class TestCustomMetricSignalInference:
+    """Test that query_custom_metric actions mark the right signals as checked."""
+
+    def test_trace_latency_query_marks_signals(self):
+        """Querying trace.grpc.server.duration should mark latency but NOT traces.
+
+        trace.* metrics are aggregate metrics derived from APM, not actual trace spans.
+        The 'traces' signal requires span-level data to follow request flows.
+        """
+        checklist = build_signal_checklist(SymptomType.LATENCY.value)
+        mark_signals_checked(
+            checklist, "query_custom_metric", step_number=1, data_found=True,
+            query="avg:trace.grpc.server.duration{service:my-svc} by {resource_name}",
+        )
+        assert checklist["latency"].checked is True
+        assert checklist["latency"].data_found is True
+        # trace.* metrics should NOT satisfy the 'traces' signal
+        assert checklist["traces"].checked is False
+
+    def test_error_query_marks_error_rate(self):
+        """Querying trace.*.errors should mark error_rate."""
+        checklist = build_signal_checklist(SymptomType.LATENCY.value)
+        mark_signals_checked(
+            checklist, "query_custom_metric", step_number=1, data_found=True,
+            query="sum:trace.grpc.server.errors{service:my-svc}.as_count()",
+        )
+        assert checklist["error_rate"].checked is True
+        assert checklist["error_rate"].data_found is True
+
+    def test_hits_query_marks_request_rate(self):
+        """Querying trace.*.hits should mark request_rate."""
+        checklist = build_signal_checklist(SymptomType.LATENCY.value)
+        mark_signals_checked(
+            checklist, "query_custom_metric", step_number=1, data_found=True,
+            query="sum:trace.grpc.server.hits{service:my-svc}.as_count()",
+        )
+        assert checklist["request_rate"].checked is True
+
+    def test_cpu_query_marks_cpu_usage(self):
+        """Querying cpu.usage should mark cpu_usage."""
+        checklist = build_signal_checklist(SymptomType.SATURATION.value)
+        mark_signals_checked(
+            checklist, "query_custom_metric", step_number=1, data_found=True,
+            query="avg:system.cpu.usage{host:my-host}",
+        )
+        assert checklist["cpu_usage"].checked is True
+
+    def test_no_query_no_inference(self):
+        """query_custom_metric without a query string should not mark anything."""
+        checklist = build_signal_checklist(SymptomType.LATENCY.value)
+        mark_signals_checked(
+            checklist, "query_custom_metric", step_number=1, data_found=True,
+        )
+        unchecked = get_unchecked_signals(checklist)
+        assert len(unchecked) == len(checklist)
+
+    def test_non_custom_action_ignores_query(self):
+        """fetch_metrics should use ACTION_TO_SIGNALS, not query inference."""
+        checklist = build_signal_checklist(SymptomType.LATENCY.value)
+        mark_signals_checked(
+            checklist, "fetch_metrics", step_number=1, data_found=True,
+            query="avg:trace.grpc.server.duration{service:my-svc}",
+        )
+        # fetch_metrics marks its own set of signals from ACTION_TO_SIGNALS
+        assert checklist["latency"].checked is True
+        assert checklist["cpu_usage"].checked is True
+
+    def test_data_found_sticky_with_custom_metric(self):
+        """data_found should remain True even if a later custom query returns empty."""
+        checklist = build_signal_checklist(SymptomType.LATENCY.value)
+        mark_signals_checked(
+            checklist, "query_custom_metric", step_number=1, data_found=True,
+            query="avg:trace.http.request.duration{service:my-svc}",
+        )
+        mark_signals_checked(
+            checklist, "query_custom_metric", step_number=2, data_found=False,
+            query="avg:trace.http.request.errors{service:my-svc}",
+        )
+        assert checklist["latency"].data_found is True

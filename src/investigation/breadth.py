@@ -168,6 +168,7 @@ class BreadthPhase:
                 step_number,
                 data_found=not empty,
                 notes=step.data_summary,
+                query=action_spec.get("query_params", {}).get("query", ""),
             )
             # Update quality on checked signals
             for signal, check in state.signal_checklist.items():

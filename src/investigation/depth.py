@@ -778,6 +778,87 @@ class DepthPhase:
 
         return list(services.values())
 
+    async def _resolve_downstream_service_name(
+        self,
+        raw_name: str,
+        namespace: str,
+        incident: IncidentQuery,
+    ) -> tuple[str, str]:
+        """Resolve a raw service name (protobuf, component, etc.) to a Datadog service name.
+
+        Tries candidate names derived from the raw name by:
+        1. Generating candidates from protobuf paths and common naming patterns
+        2. Validating each candidate against Datadog (traces query) to find one with data
+
+        Returns (resolved_service_name, resolved_namespace).
+        If no candidate validates, returns the best guess.
+        """
+        candidates = _derive_service_name_candidates(raw_name, incident.service)
+
+        if not candidates:
+            return raw_name, namespace
+
+        # Quick validation: try a trace search for each candidate to see which has data
+        for candidate in candidates:
+            try:
+                spans = await self.executor.dd_client.search_traces(
+                    f"service:{candidate}",
+                    incident.start_time,
+                    incident.end_time,
+                    limit=1,
+                )
+                if spans and len(spans) > 0:
+                    logger.info(
+                        "Resolved downstream service '%s' → '%s' (validated via traces)",
+                        raw_name, candidate,
+                    )
+                    # Try to extract namespace from the trace span tags
+                    resolved_ns = namespace
+                    if isinstance(spans[0], dict):
+                        meta = spans[0].get("meta", {})
+                        resolved_ns = (
+                            meta.get("kube_namespace", "")
+                            or meta.get("env", "")
+                            or namespace
+                        )
+                    elif hasattr(spans[0], "meta"):
+                        resolved_ns = (
+                            spans[0].meta.get("kube_namespace", "")
+                            or spans[0].meta.get("env", "")
+                            or namespace
+                        )
+                    return candidate, resolved_ns
+            except Exception as e:
+                logger.debug("Service name candidate '%s' validation failed: %s", candidate, e)
+                continue
+
+        # No candidate validated — try namespace resolution as fallback
+        ns_candidates = _derive_namespace_candidates(raw_name, incident.service)
+        for ns_candidate in ns_candidates:
+            try:
+                result = await self.executor.dd_client.query_metrics(
+                    f"avg:kubernetes.cpu.usage.total{{kube_namespace:{ns_candidate}}}",
+                    incident.start_time,
+                    incident.end_time,
+                )
+                if result and (isinstance(result, list) and len(result) > 0 or isinstance(result, dict) and result.get("series")):
+                    logger.info(
+                        "Resolved downstream namespace for '%s' → '%s' (validated via k8s metrics)",
+                        raw_name, ns_candidate,
+                    )
+                    # Use the best service candidate with the validated namespace
+                    return candidates[0], ns_candidate
+            except Exception as e:
+                logger.debug("Namespace candidate '%s' validation failed: %s", ns_candidate, e)
+                continue
+
+        # Nothing validated — return best guess (first candidate)
+        logger.info(
+            "Could not validate any service name for '%s', using best guess '%s'",
+            raw_name, candidates[0],
+        )
+        return candidates[0], namespace
+
     async def _investigate_downstream_service(
         self,
         downstream_service: str,
@@ -794,6 +875,18 @@ class DepthPhase:
         Queries: error logs, metrics, pod restarts, events.
         Returns the name of a further-downstream service if identified.
         """
+        # Resolve protobuf/component names to actual Datadog service names
+        resolved_service, resolved_namespace = await self._resolve_downstream_service_name(
+            downstream_service, namespace, incident,
+        )
+        if resolved_service != downstream_service:
+            logger.info(
+                "Depth phase: resolved '%s' → '%s' (namespace: %s)",
+                downstream_service, resolved_service, resolved_namespace or "(none)",
+            )
+            downstream_service = resolved_service
+            namespace = resolved_namespace
+
         further_downstream = None
         context_lines = []
         for e in leading.supporting_evidence[-5:]:
@@ -1046,6 +1139,23 @@ class DepthPhase:
                 "description": f"Readiness/liveness probe failures and terminations for {service}",
             })
 
+        # 6. Kubernetes events (StatefulSet updates, node restarts, scaling events)
+        # This is critical for finding infrastructure-level causes like rolling updates
+        queries.append({
+            "type": "event",
+            "query": "",  # Events use tags, not query strings
+            "signal": f"{service}_k8s_events",
+            "description": f"Kubernetes events for {service} (deployments, scaling, restarts)",
+        })
+
+        # 7. Triggered monitors for the downstream service
+        queries.append({
+            "type": "monitors",
+            "query": "",
+            "signal": f"{service}_monitors",
+            "description": f"Triggered monitors and alerts for {service}",
+        })
+
         return queries
 
     # ── Standard depth query execution ───────────────────────────────
@@ -1257,3 +1367,128 @@ class DepthPhase:
             return pod_match.group(1)
 
         return ""
+
+
+# ── Downstream service name resolution helpers ──────────────────────────
+
+
+def _derive_service_name_candidates(raw_name: str, primary_service: str) -> list[str]:
+    """Derive candidate Datadog service names from a raw name.
+
+    Handles:
+    - Protobuf service names: mercari.platform.searchtagjp.api.v2.TagSuggestService
+    - Component names: query_suggest_component
+    - Already-valid Datadog names: mercari-searchx-jp
+
+    Returns a deduplicated, ordered list of candidates to try.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(name: str) -> None:
+        if name and name not in seen and name != primary_service and len(name) >= 3:
+            seen.add(name)
+            candidates.append(name)
+
+    # If name looks like it's already a Datadog service name (has hyphens, no dots except periods)
+    if "-" in raw_name and "." not in raw_name:
+        _add(raw_name)
+        return candidates
+
+    # Protobuf service name: mercari.platform.searchtagjp.api.v2.TagSuggestService
+    if "." in raw_name:
+        parts = raw_name.split(".")
+
+        # Try the full name first (some services use dotted names)
+        _add(raw_name)
+
+        # Extract the "service domain" from protobuf path
+        # e.g., mercari.platform.searchtagjp.api.v2.TagSuggestService
+        # The service name is usually derived from the domain part before api/v1/v2
+        domain_parts: list[str] = []
+        for p in parts:
+            if p in ("api", "v1", "v2", "v3", "proto", "pb", "grpc", "service"):
+                break
+            domain_parts.append(p)
+
+        if domain_parts:
+            # e.g., ["mercari", "platform", "searchtagjp"]
+            # Try: mercari-searchtagjp-jp, mercari-searchtagjp, searchtagjp
+            # Use last meaningful part as the core service name
+            core = domain_parts[-1]  # searchtagjp
+
+            # Try with primary service prefix pattern
+            # e.g., primary = mercari-searchadapter-jp → prefix = mercari, suffix = jp
+            primary_parts = primary_service.split("-")
+            if len(primary_parts) >= 2:
+                prefix = primary_parts[0]   # mercari
+                suffix = primary_parts[-1]  # jp
+
+                # Most common pattern: prefix-core-suffix
+                _add(f"{prefix}-{core}-{suffix}")
+                # Without suffix
+                _add(f"{prefix}-{core}")
+
+            # Just the core
+            _add(core)
+
+            # Try joining domain parts with hyphens
+            # mercari.platform.searchtagjp → mercari-platform-searchtagjp
+            if len(domain_parts) >= 2:
+                _add("-".join(domain_parts))
+                # Skip "platform" if present (common protobuf namespace)
+                no_platform = [p for p in domain_parts if p != "platform"]
+                if len(no_platform) < len(domain_parts):
+                    _add("-".join(no_platform))
+
+        # Also try the last part (the RPC service class name) lowercased
+        # TagSuggestService → tagsuggestservice
+        rpc_class = parts[-1]
+        _add(rpc_class.lower())
+
+        # CamelCase to hyphen: TagSuggestService → tag-suggest-service
+        hyphenated = re.sub(r"(?<=[a-z])(?=[A-Z])", "-", rpc_class).lower()
+        _add(hyphenated)
+
+    # Component/underscore names: query_suggest_component
+    if "_" in raw_name:
+        _add(raw_name)
+        # Replace underscores with hyphens
+        _add(raw_name.replace("_", "-"))
+        # Remove common suffixes
+        for suffix in ("_component", "_service", "_server", "_client", "_worker"):
+            if raw_name.endswith(suffix):
+                base = raw_name[: -len(suffix)]
+                _add(base)
+                _add(base.replace("_", "-"))
+
+    # Plain name — just add it
+    if not candidates:
+        _add(raw_name)
+        _add(raw_name.lower())
+
+    return candidates
+
+
+def _derive_namespace_candidates(raw_name: str, primary_service: str) -> list[str]:
+    """Derive candidate Kubernetes namespace names from a raw service name.
+
+    Uses patterns from the primary service name to guess namespace conventions.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(name: str) -> None:
+        if name and name not in seen and len(name) >= 3:
+            seen.add(name)
+            candidates.append(name)
+
+    # Derive service name candidates first, then append env suffixes
+    svc_candidates = _derive_service_name_candidates(raw_name, primary_service)
+    env_suffixes = ["-prod", "-production", "-prd", ""]
+
+    for svc in svc_candidates[:4]:  # Only try top 4
+        for suffix in env_suffixes:
+            _add(f"{svc}{suffix}")
+
+    return candidates

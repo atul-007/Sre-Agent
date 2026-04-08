@@ -50,6 +50,32 @@ class TestClassifyHypothesis:
     def test_traffic_spike(self):
         assert classify_hypothesis("Sudden traffic spike overwhelmed the service") == "traffic_spike"
 
+    def test_internal_resource_constraint(self):
+        """Vague 'internal resource constraint' should match dependency_failure."""
+        assert classify_hypothesis("Internal resource constraint causing latency") == "dependency_failure"
+
+    def test_resource_constraint_fallback(self):
+        """'resource constraint' alone should match via keyword."""
+        assert classify_hypothesis("Resource constraint in backend service") == "dependency_failure"
+
+    def test_deadline_exceeded(self):
+        """gRPC DeadlineExceeded should match dependency_failure."""
+        assert classify_hypothesis("DeadlineExceeded errors propagating from downstream") == "dependency_failure"
+
+    def test_thread_pool_saturation(self):
+        """Thread pool saturation should match resource_exhaustion."""
+        assert classify_hypothesis("Thread pool saturation causing request queuing") == "resource_exhaustion"
+
+    def test_vague_latency_spike_fallback(self):
+        """Vague 'latency spike' with no specific keywords should fallback to dependency_failure."""
+        result = classify_hypothesis("Latency spike in service processing")
+        assert result != "unknown"  # Should not be unknown — infra hint fallback
+
+    def test_vague_error_fallback(self):
+        """Vague error description should fallback to dependency_failure via infra hints."""
+        result = classify_hypothesis("Service experiencing intermittent errors")
+        assert result != "unknown"
+
     def test_unknown(self):
         assert classify_hypothesis("Something completely unrelated happened") == "unknown"
 
@@ -947,3 +973,136 @@ class TestLLMRanking:
         assert "search-adapter" in result
         assert "campaign-jp" in result
         assert "Trace t1" in result
+
+
+# ── Service Name Resolution Tests ──────────────────────────────────
+
+from src.investigation.depth import _derive_service_name_candidates, _derive_namespace_candidates
+
+
+class TestDeriveServiceNameCandidates:
+    """Test protobuf/component name → Datadog service name derivation."""
+
+    def test_protobuf_to_service_names(self):
+        """Protobuf name should generate hyphenated service name candidates."""
+        candidates = _derive_service_name_candidates(
+            "mercari.platform.searchtagjp.api.v2.TagSuggestService",
+            "mercari-searchadapter-jp",
+        )
+        # Should include mercari-searchtagjp-jp (prefix-core-suffix from primary)
+        assert "mercari-searchtagjp-jp" in candidates
+        # Should include mercari-searchtagjp
+        assert "mercari-searchtagjp" in candidates
+        # Should include just the core
+        assert "searchtagjp" in candidates
+
+    def test_protobuf_camelcase_to_hyphen(self):
+        """CamelCase RPC class should be converted to hyphenated form."""
+        candidates = _derive_service_name_candidates(
+            "mercari.platform.search.v1.SearchService",
+            "mercari-home-jp",
+        )
+        assert "search-service" in candidates
+
+    def test_component_name_underscore(self):
+        """Component names with underscores should generate hyphenated variants."""
+        candidates = _derive_service_name_candidates(
+            "query_suggest_component",
+            "mercari-searchadapter-jp",
+        )
+        assert "query_suggest_component" in candidates
+        assert "query-suggest-component" in candidates
+        # Should strip _component suffix
+        assert "query_suggest" in candidates
+        assert "query-suggest" in candidates
+
+    def test_already_valid_service_name(self):
+        """Already-valid hyphenated names should be returned as-is."""
+        candidates = _derive_service_name_candidates(
+            "mercari-searchx-jp",
+            "mercari-searchadapter-jp",
+        )
+        assert candidates == ["mercari-searchx-jp"]
+
+    def test_excludes_primary_service(self):
+        """Primary service name should not appear in candidates."""
+        candidates = _derive_service_name_candidates(
+            "mercari.platform.searchadapter.api.v2.SearchService",
+            "mercari-searchadapter-jp",
+        )
+        assert "mercari-searchadapter-jp" not in candidates
+
+    def test_short_names_excluded(self):
+        """Names shorter than 3 chars should be excluded."""
+        candidates = _derive_service_name_candidates("ab", "my-service")
+        assert len(candidates) == 0
+
+    def test_empty_name(self):
+        """Empty name should return empty list."""
+        candidates = _derive_service_name_candidates("", "my-service")
+        assert len(candidates) == 0
+
+    def test_protobuf_skips_platform(self):
+        """Domain parts should try skipping 'platform' namespace."""
+        candidates = _derive_service_name_candidates(
+            "mercari.platform.searchx.api.v1.Service",
+            "mercari-home-jp",
+        )
+        assert "mercari-searchx" in candidates
+
+
+class TestDeriveNamespaceCandidates:
+    """Test namespace derivation from service names."""
+
+    def test_generates_env_suffixed_candidates(self):
+        """Should generate namespace candidates with env suffixes."""
+        candidates = _derive_namespace_candidates(
+            "mercari.platform.searchtagjp.api.v2.TagSuggestService",
+            "mercari-searchadapter-jp",
+        )
+        assert any("prod" in c for c in candidates)
+        assert any("searchtagjp" in c for c in candidates)
+
+    def test_uses_service_candidates_as_base(self):
+        """Namespace candidates should be based on service name candidates."""
+        candidates = _derive_namespace_candidates(
+            "query_suggest_component",
+            "mercari-searchadapter-jp",
+        )
+        assert any("query-suggest" in c or "query_suggest" in c for c in candidates)
+
+
+class TestBuildDownstreamQueriesExtended:
+    """Test that downstream queries include k8s events and monitors."""
+
+    def test_includes_k8s_events(self):
+        """Downstream queries should include Kubernetes event query."""
+        queries = DepthPhase._build_downstream_queries(
+            "mercari-searchx-jp", "mercari-searchx-jp-prod",
+            IncidentQuery(
+                service="mercari-searchadapter-jp",
+                symptom_type=SymptomType.LATENCY,
+                start_time=datetime.now(timezone.utc),
+                end_time=datetime.now(timezone.utc),
+                raw_query="test",
+            ),
+        )
+        signals = [q["signal"] for q in queries]
+        assert any("k8s_events" in s for s in signals)
+        assert any("monitors" in s for s in signals)
+
+    def test_includes_monitors(self):
+        """Downstream queries should include triggered monitors."""
+        queries = DepthPhase._build_downstream_queries(
+            "searchx-jp", "",
+            IncidentQuery(
+                service="mercari-searchadapter-jp",
+                symptom_type=SymptomType.LATENCY,
+                start_time=datetime.now(timezone.utc),
+                end_time=datetime.now(timezone.utc),
+                raw_query="test",
+            ),
+        )
+        types = [q["type"] for q in queries]
+        assert "event" in types
+        assert "monitors" in types
