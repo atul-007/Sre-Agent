@@ -110,6 +110,12 @@ class DepthPhase:
             leading.description[:80], category, leading.confidence * 100,
         )
 
+        # Save entry confidence as a floor — ruling out downstream services
+        # doesn't invalidate the breadth phase evidence that established the
+        # hypothesis.  Depth can increase confidence (finding the source) but
+        # should never drop it below 80% of the entry value.
+        state.depth_entry_confidence = leading.confidence
+
         # For dependency failures, use cross-service investigation
         if category == "dependency_failure":
             await self._run_cross_service_investigation(
@@ -1094,7 +1100,8 @@ class DepthPhase:
                     # Don't reduce confidence below what we had entering depth phase.
                     # Depth queries that don't find the source are inconclusive, not
                     # contradicting — especially for victim services.
-                    leading.confidence = max(0.0, leading.confidence + delta * 0.3)
+                    floor = getattr(state, "depth_entry_confidence", 0.0) * 0.8
+                    leading.confidence = max(floor, leading.confidence + delta * 0.3)
 
                 step.confidence = leading.confidence
 
@@ -1325,7 +1332,8 @@ class DepthPhase:
                 leading.contradicting_evidence.append(f"[depth:{query_spec['signal']}] {evidence_text}")
                 # Dampen negative deltas in depth phase — depth queries that don't
                 # support the hypothesis are often inconclusive, not contradicting.
-                leading.confidence = max(0.0, leading.confidence - abs(delta) * 0.3)
+                floor = getattr(state, "depth_entry_confidence", 0.0) * 0.8
+                leading.confidence = max(floor, leading.confidence - abs(delta) * 0.3)
 
             step.confidence = leading.confidence
 

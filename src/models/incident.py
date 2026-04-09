@@ -235,6 +235,7 @@ class InvestigationState(BaseModel):
     phase: str = "discovery"  # discovery|breadth|depth|concluding
     changes_detected: list[dict[str, Any]] = Field(default_factory=list)
     symptom_type: str = ""  # e.g. "error_rate", "latency" — for conclusion guards
+    depth_entry_confidence: float = 0.0  # confidence when entering depth phase (used as floor)
 
 
 class InvestigationActionType(str, Enum):

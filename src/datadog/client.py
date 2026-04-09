@@ -60,7 +60,7 @@ class DatadogClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        return (data.get("results") or {}).get("metrics", [])
+        return (data.get("results") or {}).get("metrics") or []
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     async def list_active_metrics(self, host: str = "") -> list[str]:
@@ -220,6 +220,8 @@ class DatadogClient:
 
             # Check requests in timeseries, query_value, toplist, etc.
             for request in definition.get("requests", []):
+                if not isinstance(request, dict):
+                    continue
                 # Standard query format
                 for q_field in ("q", "query"):
                     query_str = request.get(q_field, "")
