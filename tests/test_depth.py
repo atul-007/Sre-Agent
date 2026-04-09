@@ -11,7 +11,7 @@ from src.investigation.rules import (
     get_alternative_signal,
     DEPTH_QUERIES,
 )
-from src.investigation.depth import DepthPhase
+from src.investigation.depth import DepthPhase, _protobuf_covered_by
 from src.investigation.analysis import AnalysisPhase
 from src.investigation.execution import ActionExecutor
 from src.models.incident import (
@@ -732,8 +732,11 @@ class TestEarlyExitOnVictim:
         )
         # Should have taken only 1 step (traces), not 5
         assert state.downstream_steps_taken - initial == 1
-        # Should have early-exit evidence
-        assert any("early-exit" in e for e in leading.contradicting_evidence)
+        # Victim early-exit goes to supporting evidence (confirms cascading failure)
+        assert any("early-exit" in e for e in leading.supporting_evidence)
+        # Confidence delta should be dampened (0.3x), not full:
+        # started at 0.4, delta=-0.05, dampened = 0.4 + (-0.05 * 0.3) = 0.385
+        assert leading.confidence == pytest.approx(0.385, abs=0.01)
 
     @pytest.mark.asyncio
     async def test_no_early_exit_on_source_service(self):
@@ -1106,3 +1109,133 @@ class TestBuildDownstreamQueriesExtended:
         types = [q["type"] for q in queries]
         assert "event" in types
         assert "monitors" in types
+
+
+class TestProtobufCoveredBy:
+    def test_protobuf_covered_by_matching_service(self):
+        """Protobuf name with keyword matching a resolved service should be covered."""
+        resolved = {"mercari-searchtagjp-jp", "mercari-campaign-jp"}
+        assert _protobuf_covered_by(
+            "mercari.platform.searchtagjp.api.v2.TagSuggestService", resolved
+        ) is True
+
+    def test_protobuf_not_covered_by_unrelated_services(self):
+        """Protobuf name with no matching resolved service should not be covered."""
+        resolved = {"mercari-campaign-jp", "mercari-home-jp"}
+        assert _protobuf_covered_by(
+            "mercari.platform.searchtagjp.api.v2.TagSuggestService", resolved
+        ) is False
+
+    def test_protobuf_short_keywords_skipped(self):
+        """Short domain parts (<4 chars) should not be used for matching."""
+        resolved = {"mercari-api-jp"}
+        # "api" is too short and in exclusion list, so no keyword matches
+        assert _protobuf_covered_by(
+            "mercari.platform.api.v2.SomeService", resolved
+        ) is False
+
+    def test_protobuf_no_keywords(self):
+        """Protobuf name with only excluded parts should not match."""
+        resolved = {"mercari-something-jp"}
+        assert _protobuf_covered_by(
+            "mercari.api.v2.Service", resolved
+        ) is False
+
+
+class TestResolveViaResourceName:
+    """Tests for resource_name-based protobuf resolution."""
+
+    @pytest.mark.asyncio
+    async def test_resolve_via_resource_name(self):
+        """Protobuf name should resolve via resource_name trace search."""
+        config = AgentConfig()
+        dd = MagicMock()
+        reasoning = MagicMock()
+        correlation = MagicMock()
+        executor = ActionExecutor(dd, correlation, config)
+        analysis = AnalysisPhase(reasoning, correlation, config)
+        depth = DepthPhase(
+            executor=executor, reasoning=reasoning, analysis=analysis,
+            config=config, on_step_complete=None,
+        )
+
+        # First call (service:candidate) returns empty for all candidates
+        # Then resource_name search returns a span with the real service name
+        call_count = 0
+        async def mock_search_traces(query, start, end, limit=None):
+            nonlocal call_count
+            call_count += 1
+            if "resource_name:" in query:
+                return [TraceSpan(
+                    trace_id="abc", span_id="s1",
+                    service="mercari-searchtagjp-jp",
+                    operation="grpc.server",
+                    resource="/mercari.platform.searchtagjp.api.v2.TagSuggestService/Suggest",
+                    duration_ns=100_000_000,
+                    start_time=datetime.now(timezone.utc),
+                    status="ok",
+                    meta={"kube_namespace": "mercari-searchtagjp-jp-prod"},
+                )]
+            return []  # service:candidate searches return empty
+
+        dd.search_traces = mock_search_traces
+        dd.query_metrics = AsyncMock(return_value=[])
+
+        incident = IncidentQuery(
+            service="mercari-searchadapter-jp",
+            symptom_type=SymptomType.LATENCY,
+            start_time=datetime.now(timezone.utc) - timedelta(minutes=20),
+            end_time=datetime.now(timezone.utc),
+            raw_query="test",
+        )
+
+        resolved_name, resolved_ns = await depth._resolve_downstream_service_name(
+            "mercari.platform.searchtagjp.api.v2.TagSuggestService", "", incident,
+        )
+        assert resolved_name == "mercari-searchtagjp-jp"
+        assert resolved_ns == "mercari-searchtagjp-jp-prod"
+
+    @pytest.mark.asyncio
+    async def test_non_protobuf_skips_resource_name(self):
+        """Non-protobuf names (no dots) should skip resource_name search."""
+        config = AgentConfig()
+        dd = MagicMock()
+        reasoning = MagicMock()
+        correlation = MagicMock()
+        executor = ActionExecutor(dd, correlation, config)
+        analysis = AnalysisPhase(reasoning, correlation, config)
+        depth = DepthPhase(
+            executor=executor, reasoning=reasoning, analysis=analysis,
+            config=config, on_step_complete=None,
+        )
+
+        queries_made = []
+        async def mock_search_traces(query, start, end, limit=None):
+            queries_made.append(query)
+            if "service:mercari-campaign-jp" in query:
+                return [TraceSpan(
+                    trace_id="abc", span_id="s1",
+                    service="mercari-campaign-jp",
+                    operation="grpc.server", resource="GetData",
+                    duration_ns=100_000, start_time=datetime.now(timezone.utc),
+                    status="ok",
+                )]
+            return []
+
+        dd.search_traces = mock_search_traces
+        dd.query_metrics = AsyncMock(return_value=[])
+
+        incident = IncidentQuery(
+            service="mercari-searchadapter-jp",
+            symptom_type=SymptomType.LATENCY,
+            start_time=datetime.now(timezone.utc) - timedelta(minutes=20),
+            end_time=datetime.now(timezone.utc),
+            raw_query="test",
+        )
+
+        resolved_name, _ = await depth._resolve_downstream_service_name(
+            "mercari-campaign-jp", "", incident,
+        )
+        assert resolved_name == "mercari-campaign-jp"
+        # Should NOT have made a resource_name search
+        assert not any("resource_name:" in q for q in queries_made)

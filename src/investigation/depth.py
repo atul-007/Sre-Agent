@@ -419,6 +419,19 @@ class DepthPhase:
                 merged[svc["service_name"]] = svc
 
         all_services = list(merged.values())
+
+        # Filter out protobuf/dotted names that overlap with resolved Datadog service names
+        resolved_names = {
+            s["service_name"] for s in all_services
+            if "-" in s["service_name"] and "." not in s["service_name"]
+        }
+        if resolved_names:
+            all_services = [
+                s for s in all_services
+                if "." not in s["service_name"]
+                or not _protobuf_covered_by(s["service_name"], resolved_names)
+            ]
+
         # Sort by priority: high first (fallback ordering)
         priority_order = {"high": 0, "medium": 1, "low": 2}
         all_services.sort(key=lambda s: priority_order.get(s.get("investigation_priority", "low"), 2))
@@ -764,11 +777,29 @@ class DepthPhase:
             all_text,
         ):
             proto_svc = match.group(1)
-            # Extract a likely K8s-friendly name from the protobuf path
-            # e.g., mercari.platform.home.ddui.v1.ComponentService -> ComponentService
+            # Extract domain keywords from protobuf path to check against already-discovered services
+            # e.g., mercari.platform.searchtagjp.api.v2.TagSuggestService → keywords: [searchtagjp]
             parts = proto_svc.split(".")
-            svc_name = parts[-1]  # e.g., ComponentService
-            # Use the full protobuf name as hint for Claude
+            domain_keywords = [
+                p.lower() for p in parts
+                if p[0:1].islower()
+                and len(p) >= 4
+                and p.lower() not in ("mercari", "platform", "api", "proto", "grpc", "service")
+            ]
+
+            # Check if any already-discovered trace service covers this protobuf name
+            already_covered = False
+            for existing_svc in services:
+                if "." in existing_svc:
+                    continue  # Skip other protobuf names
+                existing_lower = existing_svc.lower().replace("-", "")
+                if any(kw in existing_lower for kw in domain_keywords):
+                    already_covered = True
+                    break
+
+            if already_covered:
+                continue
+
             services.setdefault(proto_svc, {
                 "service_name": proto_svc,
                 "source": "gRPC protobuf service name",
@@ -832,7 +863,34 @@ class DepthPhase:
                 logger.debug("Service name candidate '%s' validation failed: %s", candidate, e)
                 continue
 
-        # No candidate validated — try namespace resolution as fallback
+        # Strategy 2: Search by resource_name for protobuf service names.
+        # gRPC traces have resource_name like "/mercari.platform.searchtagjp.api.v2.TagSuggestService/Suggest"
+        # so searching resource_name:*<protobuf_path>* reveals the actual Datadog service.
+        if "." in raw_name:
+            try:
+                spans = await self.executor.dd_client.search_traces(
+                    f"resource_name:*{raw_name}*",
+                    incident.start_time,
+                    incident.end_time,
+                    limit=1,
+                )
+                if spans:
+                    resolved_service = spans[0].service
+                    resolved_ns = namespace
+                    if hasattr(spans[0], "meta"):
+                        resolved_ns = (
+                            spans[0].meta.get("kube_namespace", "")
+                            or namespace
+                        )
+                    logger.info(
+                        "Resolved downstream service '%s' → '%s' (via resource_name search)",
+                        raw_name, resolved_service,
+                    )
+                    return resolved_service, resolved_ns
+            except Exception as e:
+                logger.debug("Resource name search for '%s' failed: %s", raw_name, e)
+
+        # Strategy 3: Namespace resolution as fallback
         ns_candidates = _derive_namespace_candidates(raw_name, incident.service)
         for ns_candidate in ns_candidates:
             try:
@@ -846,7 +904,23 @@ class DepthPhase:
                         "Resolved downstream namespace for '%s' → '%s' (validated via k8s metrics)",
                         raw_name, ns_candidate,
                     )
-                    # Use the best service candidate with the validated namespace
+                    # If service candidate is still protobuf, try trace search in this namespace
+                    if "." in candidates[0]:
+                        try:
+                            ns_spans = await self.executor.dd_client.search_traces(
+                                f"kube_namespace:{ns_candidate} status:error",
+                                incident.start_time,
+                                incident.end_time,
+                                limit=1,
+                            )
+                            if ns_spans:
+                                logger.info(
+                                    "Resolved service in namespace '%s' → '%s'",
+                                    ns_candidate, ns_spans[0].service,
+                                )
+                                return ns_spans[0].service, ns_candidate
+                        except Exception:
+                            pass
                     return candidates[0], ns_candidate
             except Exception as e:
                 logger.debug("Namespace candidate '%s' validation failed: %s", ns_candidate, e)
@@ -954,7 +1028,7 @@ class DepthPhase:
                 "log": InvestigationActionType.SEARCH_LOGS_CUSTOM,
                 "trace": InvestigationActionType.FETCH_TRACES,
                 "event": InvestigationActionType.FETCH_DEPLOYMENTS,
-                "monitors": InvestigationActionType.QUERY_CUSTOM_METRIC,
+                "monitors": InvestigationActionType.FETCH_MONITORS,
             }
             step_action = action_type_map.get(
                 query_spec["type"], InvestigationActionType.QUERY_CUSTOM_METRIC
@@ -1017,7 +1091,10 @@ class DepthPhase:
                     leading.contradicting_evidence.append(
                         f"[depth:downstream:{downstream_service}:{query_spec['signal']}] {evidence_text}"
                     )
-                    leading.confidence = max(0.0, leading.confidence + delta)
+                    # Don't reduce confidence below what we had entering depth phase.
+                    # Depth queries that don't find the source are inconclusive, not
+                    # contradicting — especially for victim services.
+                    leading.confidence = max(0.0, leading.confidence + delta * 0.3)
 
                 step.confidence = leading.confidence
 
@@ -1051,7 +1128,9 @@ class DepthPhase:
                                 "Depth phase: %s is a victim (%s), skipping remaining queries",
                                 downstream_service, victim_mechanism[:80],
                             )
-                            leading.contradicting_evidence.append(
+                            # Victim services support the dependency-failure hypothesis:
+                            # they confirm cascading failure from further upstream.
+                            leading.supporting_evidence.append(
                                 f"[depth:downstream:{downstream_service}:early-exit] "
                                 f"Service is a victim, not a source: {victim_mechanism[:150]}"
                             )
@@ -1244,7 +1323,9 @@ class DepthPhase:
             else:
                 evidence_text = analysis_result.get("evidence_summary", query_spec["description"])
                 leading.contradicting_evidence.append(f"[depth:{query_spec['signal']}] {evidence_text}")
-                leading.confidence = max(0.0, leading.confidence - abs(delta))
+                # Dampen negative deltas in depth phase — depth queries that don't
+                # support the hypothesis are often inconclusive, not contradicting.
+                leading.confidence = max(0.0, leading.confidence - abs(delta) * 0.3)
 
             step.confidence = leading.confidence
 
@@ -1370,6 +1451,30 @@ class DepthPhase:
 
 
 # ── Downstream service name resolution helpers ──────────────────────────
+
+
+def _protobuf_covered_by(proto_name: str, resolved_names: set[str]) -> bool:
+    """Check if a protobuf service name is already covered by a resolved Datadog service name.
+
+    Extracts domain keywords from the protobuf path and checks if any resolved
+    service name contains them.
+    E.g., "mercari.platform.searchtagjp.api.v2.TagSuggestService" has keyword
+    "searchtagjp" which matches resolved name "mercari-searchtagjp-jp".
+    """
+    parts = proto_name.split(".")
+    keywords = [
+        p.lower() for p in parts
+        if p[0:1].islower()
+        and len(p) >= 4
+        and p.lower() not in ("mercari", "platform", "api", "proto", "grpc", "service")
+    ]
+    if not keywords:
+        return False
+    for rn in resolved_names:
+        rn_lower = rn.lower().replace("-", "")
+        if any(kw in rn_lower for kw in keywords):
+            return True
+    return False
 
 
 def _derive_service_name_candidates(raw_name: str, primary_service: str) -> list[str]:

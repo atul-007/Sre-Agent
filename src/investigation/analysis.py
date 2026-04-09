@@ -40,6 +40,30 @@ from src.models.incident import (
 logger = logging.getLogger(__name__)
 
 
+def _is_near_duplicate(new_entry: str, existing: list[str], threshold: float = 0.6) -> bool:
+    """Check if new_entry is semantically similar to any existing entry.
+
+    Uses word overlap ratio — if >=60% of words in the shorter string appear
+    in the longer string, consider it a duplicate.
+    """
+    new_words = set(new_entry.lower().split())
+    if not new_words:
+        return False
+    for existing_entry in existing:
+        existing_words = set(existing_entry.lower().split())
+        if not existing_words:
+            continue
+        shorter, longer = (
+            (new_words, existing_words)
+            if len(new_words) <= len(existing_words)
+            else (existing_words, new_words)
+        )
+        overlap = len(shorter & longer) / len(shorter)
+        if overlap >= threshold:
+            return True
+    return False
+
+
 class AnalysisPhase:
     """Handles Claude-based analysis of investigation data and hypothesis management."""
 
@@ -151,13 +175,25 @@ class AnalysisPhase:
 
         # Build root cause hypothesis
         root_cause_data = parsed.get("root_cause", {})
-        rc_supporting = ensure_str_list(root_cause_data.get("supporting_evidence", []))
-        rc_contradicting = ensure_str_list(root_cause_data.get("contradicting_evidence", []))
+        # Use tracked hypothesis evidence as base (already deduplicated during investigation).
+        # Only add Claude's report evidence if it's genuinely new (not a rephrased duplicate).
         if state.hypotheses:
             top_hyp = max(state.hypotheses.values(), key=lambda h: h.confidence, default=None)
             if top_hyp:
-                rc_supporting = list(set(rc_supporting + top_hyp.supporting_evidence))
-                rc_contradicting = list(set(rc_contradicting + top_hyp.contradicting_evidence))
+                rc_supporting = list(top_hyp.supporting_evidence)
+                rc_contradicting = list(top_hyp.contradicting_evidence)
+                for e in ensure_str_list(root_cause_data.get("supporting_evidence", [])):
+                    if not _is_near_duplicate(e, rc_supporting):
+                        rc_supporting.append(e)
+                for e in ensure_str_list(root_cause_data.get("contradicting_evidence", [])):
+                    if not _is_near_duplicate(e, rc_contradicting):
+                        rc_contradicting.append(e)
+            else:
+                rc_supporting = ensure_str_list(root_cause_data.get("supporting_evidence", []))
+                rc_contradicting = ensure_str_list(root_cause_data.get("contradicting_evidence", []))
+        else:
+            rc_supporting = ensure_str_list(root_cause_data.get("supporting_evidence", []))
+            rc_contradicting = ensure_str_list(root_cause_data.get("contradicting_evidence", []))
 
         root_cause = Hypothesis(
             id="h1",

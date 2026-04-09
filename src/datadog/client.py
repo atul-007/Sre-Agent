@@ -60,7 +60,7 @@ class DatadogClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data.get("results", {}).get("metrics", [])
+        return (data.get("results") or {}).get("metrics", [])
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     async def list_active_metrics(self, host: str = "") -> list[str]:
