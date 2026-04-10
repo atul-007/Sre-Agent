@@ -73,7 +73,7 @@ class TestExtractTags:
 class TestParseDatadogAlertMessage:
     def test_parse_from_text(self):
         text = (
-            "Triggered: [mercari-search-platform][production] "
+            "Triggered: [search-platform][production] "
             "K8s pod CPU usage on container_name:flink-main-container,"
             "kube_deployment:mk-sp-event-log-router\n"
             "CPU Usage is 92.51%\n"
@@ -126,22 +126,22 @@ class TestParseDatadogAlertMessage:
     def test_real_world_datadog_alert(self):
         """Test with a realistic Datadog Slack alert format."""
         text = (
-            "Triggered: [mercari-search-platform][production]K8s pod CPU usage "
+            "Triggered: [search-platform][production]K8s pod CPU usage "
             "on container_name:flink-main-container,"
             "kube_deployment:mk-sp-event-log-router,"
             "pod_name:mk-sp-event-log-router-58f87f4fb6-xmq8f"
             "One (or more) pod(s) CPU usage percentage of deployment "
             "mk-sp-event-log-router container flink-main-container "
             "is above the thresholds.\nCPU Usage is 92.51%\n"
-            "@slack-alert-mk-search-middleware-jp\n"
+            "@slack-alert-search-team\n"
             "avg(last_10m):   (     "
             "sum:kubernetes.cpu.usage.total{"
-            "kube_namespace:mercari-search-platform-prod,"
-            "cluster-name:citadel-2g-prod-tokyo-01} by "
+            "kube_namespace:search-platform-prod,"
+            "cluster-name:cluster-prod-01} by "
             "{container_name,pod_name,kube_deployment} / (1000 * 1000 * 1000) /     "
             "sum:kubernetes.cpu.limits{"
-            "kube_namespace:mercari-search-platform-prod,"
-            "cluster-name:citadel-2g-prod-tokyo-01} by "
+            "kube_namespace:search-platform-prod,"
+            "cluster-name:cluster-prod-01} by "
             "{container_name,pod_name,kube_deployment}   )   * 100 > 80\n"
             "Metric value: 92.51\n"
             "https://app.datadoghq.com/monitors/98765"

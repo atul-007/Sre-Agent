@@ -127,8 +127,8 @@ def _extract_tags_from_alert(text: str) -> dict[str, str]:
 
     Looks for patterns like:
     - container_name:query-server
-    - kube_namespace:mercari-search-platform-prod
-    - cluster-name:citadel-2g-prod-tokyo-01
+    - kube_namespace:my-service-prod
+    - cluster-name:cluster-prod-us-east-01
     - Tags section: container_name:query-server, kube_deployment:query-server
     """
     tags: dict[str, str] = {}

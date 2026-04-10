@@ -328,8 +328,8 @@ IMPORTANT: The root cause description MUST clarify the full dependency path.
 If the alerted service is affected by an issue in a downstream dependency,
 state explicitly which service owns the failing component and the exact path
 through which it impacts the alerted service. For example:
-"Spanner query timeouts in mercari-authority-spanner caused auth failures in
-mercari-authority, which cascaded into search-platform via authentication dependency"
+"Database query timeouts in auth-db caused authentication failures in
+auth-service, which cascaded into api-gateway via authentication dependency"
 
 Remediation steps MUST specify which service/team should take each action.
 

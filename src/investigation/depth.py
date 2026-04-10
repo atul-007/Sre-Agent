@@ -183,9 +183,9 @@ class DepthPhase:
         4. Follow further downstream if needed
         """
         # Step 1: Follow trace IDs to discover downstream services
-        # Client-side spans (service=mercari-home-jp) don't reveal downstream
-        # service names. We need to look up ALL spans in the same traces to
-        # find server-side spans from the actual downstream services.
+        # Client-side spans don't reveal downstream service names.
+        # We need to look up ALL spans in the same traces to find
+        # server-side spans from the actual downstream services.
         trace_discovered = await self._follow_trace_ids(
             incident, trace, state, accumulated_data, leading,
         )
@@ -669,7 +669,7 @@ class DepthPhase:
         if name.endswith(".org") or name.endswith(".com") or name.endswith(".io"):
             return False
         # Real service names almost always contain a hyphen or underscore
-        # or have a domain-like structure (e.g., mercari-searchx-jp)
+        # or have a domain-like structure (e.g., my-search-service)
         has_separator = "-" in name or "_" in name or "." in name
         # Single words without separators are likely English words, not services
         if not has_separator and name.isalpha():
@@ -722,7 +722,7 @@ class DepthPhase:
         all_text = " ".join(all_evidence)
 
         # Pattern 1: Tag-style values with colon separator (most reliable)
-        # Matches: from-service:mercari-searchx-jp, search-service:triton-text-embeddings
+        # Matches: from-service:my-search-svc, search-service:embedding-service
         for match in re.finditer(
             r"(?:from[_-]service|search[_-]service|peer_service|target_service|"
             r"downstream_service|upstream_service):([a-zA-Z0-9][-a-zA-Z0-9_.]+)",
@@ -738,7 +738,7 @@ class DepthPhase:
                 }
 
         # Pattern 2: Kubernetes service endpoints in logs (very reliable)
-        # e.g., triton-text-embeddings-ruri-small-v2.mercari-embeddings-jp-prod.svc.cluster.local:8001
+        # e.g., embedding-service.embeddings-prod.svc.cluster.local:8001
         for match in re.finditer(
             r"([a-zA-Z0-9][-a-zA-Z0-9]*)\.([-a-zA-Z0-9]+)\.svc\.cluster\.local",
             all_text,
@@ -782,7 +782,7 @@ class DepthPhase:
                     "investigation_priority": "medium",
                 })
 
-        # Pattern 5: gRPC protobuf service names (e.g., mercari.platform.home.ddui.v1.ComponentService)
+        # Pattern 5: gRPC protobuf service names (e.g., myorg.platform.home.ddui.v1.ComponentService)
         # These need to be mapped to K8s service names by Claude, but we capture the
         # package prefix which often maps to a team/service namespace
         for match in re.finditer(
@@ -791,13 +791,13 @@ class DepthPhase:
         ):
             proto_svc = match.group(1)
             # Extract domain keywords from protobuf path to check against already-discovered services
-            # e.g., mercari.platform.searchtagjp.api.v2.TagSuggestService → keywords: [searchtagjp]
+            # e.g., myorg.platform.search.api.v2.TagSuggestService → keywords: [search]
             parts = proto_svc.split(".")
             domain_keywords = [
                 p.lower() for p in parts
                 if p[0:1].islower()
                 and len(p) >= 4
-                and p.lower() not in ("mercari", "platform", "api", "proto", "grpc", "service")
+                and p.lower() not in ("platform", "api", "proto", "grpc", "service")
             ]
 
             # Check if any already-discovered trace service covers this protobuf name
@@ -877,7 +877,7 @@ class DepthPhase:
                 continue
 
         # Strategy 2: Search by resource_name for protobuf service names.
-        # gRPC traces have resource_name like "/mercari.platform.searchtagjp.api.v2.TagSuggestService/Suggest"
+        # gRPC traces have resource_name like "/myorg.platform.search.api.v2.SearchService/Query"
         # so searching resource_name:*<protobuf_path>* reveals the actual Datadog service.
         if "." in raw_name:
             try:
@@ -1473,15 +1473,15 @@ def _protobuf_covered_by(proto_name: str, resolved_names: set[str]) -> bool:
 
     Extracts domain keywords from the protobuf path and checks if any resolved
     service name contains them.
-    E.g., "mercari.platform.searchtagjp.api.v2.TagSuggestService" has keyword
-    "searchtagjp" which matches resolved name "mercari-searchtagjp-jp".
+    E.g., "myorg.platform.search.api.v2.SearchService" has keyword
+    "search" which matches resolved name "myorg-search-prod".
     """
     parts = proto_name.split(".")
     keywords = [
         p.lower() for p in parts
         if p[0:1].islower()
         and len(p) >= 4
-        and p.lower() not in ("mercari", "platform", "api", "proto", "grpc", "service")
+        and p.lower() not in ("platform", "api", "proto", "grpc", "service")
     ]
     if not keywords:
         return False
@@ -1496,9 +1496,9 @@ def _derive_service_name_candidates(raw_name: str, primary_service: str) -> list
     """Derive candidate Datadog service names from a raw name.
 
     Handles:
-    - Protobuf service names: mercari.platform.searchtagjp.api.v2.TagSuggestService
+    - Protobuf service names: myorg.platform.search.api.v2.SearchService
     - Component names: query_suggest_component
-    - Already-valid Datadog names: mercari-searchx-jp
+    - Already-valid Datadog names: my-search-service
 
     Returns a deduplicated, ordered list of candidates to try.
     """
@@ -1515,7 +1515,7 @@ def _derive_service_name_candidates(raw_name: str, primary_service: str) -> list
         _add(raw_name)
         return candidates
 
-    # Protobuf service name: mercari.platform.searchtagjp.api.v2.TagSuggestService
+    # Protobuf service name: myorg.platform.search.api.v2.SearchService
     if "." in raw_name:
         parts = raw_name.split(".")
 
@@ -1523,7 +1523,7 @@ def _derive_service_name_candidates(raw_name: str, primary_service: str) -> list
         _add(raw_name)
 
         # Extract the "service domain" from protobuf path
-        # e.g., mercari.platform.searchtagjp.api.v2.TagSuggestService
+        # e.g., myorg.platform.search.api.v2.SearchService
         # The service name is usually derived from the domain part before api/v1/v2
         domain_parts: list[str] = []
         for p in parts:
@@ -1532,16 +1532,16 @@ def _derive_service_name_candidates(raw_name: str, primary_service: str) -> list
             domain_parts.append(p)
 
         if domain_parts:
-            # e.g., ["mercari", "platform", "searchtagjp"]
-            # Try: mercari-searchtagjp-jp, mercari-searchtagjp, searchtagjp
+            # e.g., ["myorg", "platform", "search"]
+            # Try: myorg-search-prod, myorg-search, search
             # Use last meaningful part as the core service name
             core = domain_parts[-1]  # searchtagjp
 
             # Try with primary service prefix pattern
-            # e.g., primary = mercari-searchadapter-jp → prefix = mercari, suffix = jp
+            # e.g., primary = myorg-adapter-prod → prefix = myorg, suffix = prod
             primary_parts = primary_service.split("-")
             if len(primary_parts) >= 2:
-                prefix = primary_parts[0]   # mercari
+                prefix = primary_parts[0]   # e.g., myorg
                 suffix = primary_parts[-1]  # jp
 
                 # Most common pattern: prefix-core-suffix
@@ -1553,7 +1553,7 @@ def _derive_service_name_candidates(raw_name: str, primary_service: str) -> list
             _add(core)
 
             # Try joining domain parts with hyphens
-            # mercari.platform.searchtagjp → mercari-platform-searchtagjp
+            # myorg.platform.search → myorg-platform-search
             if len(domain_parts) >= 2:
                 _add("-".join(domain_parts))
                 # Skip "platform" if present (common protobuf namespace)

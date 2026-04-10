@@ -177,11 +177,11 @@ class TestNamespaceCandidateGeneration:
 
     def test_namespace_hint_with_suffixes(self):
         candidates = DiscoveryPhase.generate_namespace_candidates(
-            "production", "my-svc", {"namespace": "mercari-search-platform"}
+            "production", "my-svc", {"namespace": "search-platform"}
         )
-        assert "mercari-search-platform-prod" in candidates
-        assert "mercari-search-platform-production" in candidates
-        assert "mercari-search-platform" in candidates
+        assert "search-platform-prod" in candidates
+        assert "search-platform-production" in candidates
+        assert "search-platform" in candidates
 
     def test_deduplicates(self):
         candidates = DiscoveryPhase.generate_namespace_candidates(
@@ -270,7 +270,7 @@ class TestDiscoverServiceContextIntegration:
             start_time=now - timedelta(hours=1),
             end_time=now,
             environment="production",
-            source_tags={"namespace": "mercari-search-platform"},
+            source_tags={"namespace": "search-platform"},
         )
 
     @pytest.mark.asyncio
@@ -312,7 +312,7 @@ class TestDiscoverServiceContextIntegration:
         async def mock_query_metrics(query, start, end):
             nonlocal call_count
             call_count += 1
-            if "mercari-search-platform-prod" in query:
+            if "search-platform-prod" in query:
                 # Return a non-empty result
                 from src.models.incident import MetricSeries, MetricDataPoint
                 return [MetricSeries(
@@ -325,8 +325,8 @@ class TestDiscoverServiceContextIntegration:
         dd.query_metrics = mock_query_metrics
 
         ctx = await discovery.discover(incident)
-        assert ctx.resolved_namespace == "mercari-search-platform-prod"
-        assert ctx.resolved_tags.get("kube_namespace") == "mercari-search-platform-prod"
+        assert ctx.resolved_namespace == "search-platform-prod"
+        assert ctx.resolved_tags.get("kube_namespace") == "search-platform-prod"
 
     @pytest.mark.asyncio
     async def test_mines_dashboards(self):
@@ -378,7 +378,7 @@ class TestDiscoverServiceContextIntegration:
             {
                 "tags_by_source": {
                     "datadog": [
-                        "kube_namespace:mercari-search-platform-prod",
+                        "kube_namespace:search-platform-prod",
                         "kube_cluster_name:prod-cluster",
                         "env:production",
                     ]
@@ -387,7 +387,7 @@ class TestDiscoverServiceContextIntegration:
         ])
 
         ctx = await discovery.discover(incident)
-        assert ctx.resolved_tags.get("kube_namespace") == "mercari-search-platform-prod"
+        assert ctx.resolved_tags.get("kube_namespace") == "search-platform-prod"
         assert ctx.resolved_tags.get("env") == "production"
 
     @pytest.mark.asyncio

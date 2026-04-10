@@ -309,21 +309,21 @@ class TestExtractServicesFromEvidence:
 
     def test_extracts_from_service_tag(self):
         """Should extract downstream service from circuit breaker from-service tag."""
-        incident = self._make_incident("mercari-product-search-jp")
+        incident = self._make_incident("product-search-svc")
         state = InvestigationState()
         hyp = TrackedHypothesis(
             id="h1",
             description="Downstream dependency failure via circuit breaker",
             status=HypothesisStatus.INVESTIGATING,
             supporting_evidence=[
-                "Circuit breaker opened for from-service:mercari-searchx-jp to search-service:triton-text-embeddings-ruri-small-v2-ft",
+                "Circuit breaker opened for from-service:company-adapter-svc to search-service:triton-text-embeddings-ruri-small-v2-ft",
                 "Stable throughput at primary service",
             ],
             contradicting_evidence=[],
         )
         result = DepthPhase._extract_services_from_evidence(hyp, state, incident)
         service_names = [s["service_name"] for s in result]
-        assert "mercari-searchx-jp" in service_names or "triton-text-embeddings-ruri-small-v2-ft" in service_names
+        assert "company-adapter-svc" in service_names or "triton-text-embeddings-ruri-small-v2-ft" in service_names
 
     def test_extracts_k8s_endpoint(self):
         """Should extract service and namespace from Kubernetes service endpoints."""
@@ -334,14 +334,14 @@ class TestExtractServicesFromEvidence:
             description="Downstream timeout",
             status=HypothesisStatus.INVESTIGATING,
             supporting_evidence=[
-                "Error connecting to triton-text-embeddings-ruri-small-v2.mercari-embeddings-jp-prod.svc.cluster.local:8001",
+                "Error connecting to triton-text-embeddings-ruri-small-v2.embeddings-prod.svc.cluster.local:8001",
             ],
         )
         result = DepthPhase._extract_services_from_evidence(hyp, state, incident)
         assert len(result) > 0
         svc = result[0]
         assert svc["service_name"] == "triton-text-embeddings-ruri-small-v2"
-        assert svc["likely_k8s_namespace"] == "mercari-embeddings-jp-prod"
+        assert svc["likely_k8s_namespace"] == "embeddings-prod"
 
     def test_ignores_primary_service(self):
         """Should not return the primary service being investigated."""
@@ -376,7 +376,7 @@ class TestExtractServicesFromEvidence:
 
     def test_rejects_english_words(self):
         """Should NOT extract common English words like 'pairs', 'issue', 'failure'."""
-        incident = self._make_incident("mercari-product-search-jp")
+        incident = self._make_incident("product-search-svc")
         state = InvestigationState()
         hyp = TrackedHypothesis(
             id="h1",
@@ -411,7 +411,7 @@ class TestBuildDownstreamQueries:
     def test_generates_queries(self):
         incident = self._make_incident()
         queries = DepthPhase._build_downstream_queries(
-            "triton-text-embeddings", "mercari-embeddings-prod", incident,
+            "triton-text-embeddings", "embeddings-prod", incident,
         )
         assert len(queries) >= 4
         signals = [q["signal"] for q in queries]
@@ -489,7 +489,7 @@ class TestDepthPhaseDependencyFailure:
             status=HypothesisStatus.INVESTIGATING,
             confidence=0.35,
             supporting_evidence=[
-                "Circuit breaker opened for from-service:searchx-jp to search-service:triton-embeddings",
+                "Circuit breaker opened for from-service:search-jp to search-service:triton-embeddings",
             ],
         )
         trace = InvestigationTrace()
@@ -508,7 +508,7 @@ class TestDepthPhaseDependencyFailure:
         # Should have run depth steps investigating the downstream service
         assert trace.total_steps > 0
         assert state.depth_steps_taken > 0
-        # Should have investigated triton-embeddings or searchx-jp
+        # Should have investigated triton-embeddings or search-jp
         data_sources = [s.data_source for s in trace.steps]
         assert any(ds != "product-search" for ds in data_sources), \
             f"Expected downstream service investigation, got: {data_sources}"
@@ -546,7 +546,7 @@ class TestDepthPhaseDependencyFailure:
 class TestProtobufServiceExtraction:
     """Tests for gRPC protobuf service name pattern extraction."""
 
-    def _make_incident(self, service="mercari-home-jp"):
+    def _make_incident(self, service="home-service"):
         now = datetime.now(timezone.utc)
         return IncidentQuery(
             raw_query="Error logs alert",
@@ -557,7 +557,7 @@ class TestProtobufServiceExtraction:
         )
 
     def test_extracts_grpc_protobuf_service(self):
-        """Should extract gRPC protobuf service names like mercari.platform.home.ddui.v1.ComponentService."""
+        """Should extract gRPC protobuf service names like myorg.platform.home.ddui.v1.ComponentService."""
         incident = self._make_incident()
         state = InvestigationState()
         hyp = TrackedHypothesis(
@@ -565,12 +565,12 @@ class TestProtobufServiceExtraction:
             description="ComponentService failure causing errors",
             status=HypothesisStatus.INVESTIGATING,
             supporting_evidence=[
-                "rpc error: code = Internal desc = failed to get components on service call to mercari.platform.home.ddui.v1.ComponentService",
+                "rpc error: code = Internal desc = failed to get components on service call to myorg.platform.home.ddui.v1.ComponentService",
             ],
         )
         result = DepthPhase._extract_services_from_evidence(hyp, state, incident)
         service_names = [s["service_name"] for s in result]
-        assert "mercari.platform.home.ddui.v1.ComponentService" in service_names
+        assert "myorg.platform.home.ddui.v1.ComponentService" in service_names
 
     def test_protobuf_service_has_high_priority(self):
         """gRPC protobuf services should have high investigation priority."""
@@ -581,7 +581,7 @@ class TestProtobufServiceExtraction:
             description="Service failure",
             status=HypothesisStatus.INVESTIGATING,
             supporting_evidence=[
-                "Method call to service mercari.platform.search.v2.SearchService returned Internal",
+                "Method call to service myorg.platform.search.v2.SearchService returned Internal",
             ],
         )
         result = DepthPhase._extract_services_from_evidence(hyp, state, incident)
@@ -953,28 +953,28 @@ class TestLLMRanking:
         data.traces = [
             TraceSpan(
                 trace_id="t1", span_id="root", parent_id="",
-                service="home-jp", operation="grpc.server",
+                service="company-home-svc", operation="grpc.server",
                 resource="/GetComponents", duration_ns=50_000_000,
                 start_time=now, status="error",
             ),
             TraceSpan(
                 trace_id="t1", span_id="child1", parent_id="root",
-                service="search-adapter", operation="grpc.client",
+                service="company-adapter", operation="grpc.client",
                 resource="SearchComponents", duration_ns=40_000_000,
                 start_time=now, status="error",
             ),
             TraceSpan(
                 trace_id="t1", span_id="child2", parent_id="root",
-                service="campaign-jp", operation="grpc.client",
+                service="company-campaign-svc", operation="grpc.client",
                 resource="GetCampaigns", duration_ns=20_000_000,
                 start_time=now, status="ok",
             ),
         ]
 
-        result = DepthPhase._build_trace_tree_summary(data, "home-jp")
-        assert "home-jp" in result
-        assert "search-adapter" in result
-        assert "campaign-jp" in result
+        result = DepthPhase._build_trace_tree_summary(data, "company-home-svc")
+        assert "company-home-svc" in result
+        assert "company-adapter" in result
+        assert "company-campaign-svc" in result
         assert "Trace t1" in result
 
 
@@ -989,21 +989,21 @@ class TestDeriveServiceNameCandidates:
     def test_protobuf_to_service_names(self):
         """Protobuf name should generate hyphenated service name candidates."""
         candidates = _derive_service_name_candidates(
-            "mercari.platform.searchtagjp.api.v2.TagSuggestService",
-            "mercari-searchadapter-jp",
+            "myorg.platform.tags.api.v2.TagSuggestService",
+            "company-adapter-svc",
         )
-        # Should include mercari-searchtagjp-jp (prefix-core-suffix from primary)
-        assert "mercari-searchtagjp-jp" in candidates
-        # Should include mercari-searchtagjp
-        assert "mercari-searchtagjp" in candidates
+        # Should include company-tags-svc (prefix-core-suffix from primary)
+        assert "company-tags-svc" in candidates
+        # Should include company-tags
+        assert "company-tags" in candidates
         # Should include just the core
-        assert "searchtagjp" in candidates
+        assert "tags" in candidates
 
     def test_protobuf_camelcase_to_hyphen(self):
         """CamelCase RPC class should be converted to hyphenated form."""
         candidates = _derive_service_name_candidates(
-            "mercari.platform.search.v1.SearchService",
-            "mercari-home-jp",
+            "myorg.platform.search.v1.SearchService",
+            "company-home-svc",
         )
         assert "search-service" in candidates
 
@@ -1011,7 +1011,7 @@ class TestDeriveServiceNameCandidates:
         """Component names with underscores should generate hyphenated variants."""
         candidates = _derive_service_name_candidates(
             "query_suggest_component",
-            "mercari-searchadapter-jp",
+            "company-adapter-svc",
         )
         assert "query_suggest_component" in candidates
         assert "query-suggest-component" in candidates
@@ -1022,18 +1022,18 @@ class TestDeriveServiceNameCandidates:
     def test_already_valid_service_name(self):
         """Already-valid hyphenated names should be returned as-is."""
         candidates = _derive_service_name_candidates(
-            "mercari-searchx-jp",
-            "mercari-searchadapter-jp",
+            "company-search-svc",
+            "company-adapter-svc",
         )
-        assert candidates == ["mercari-searchx-jp"]
+        assert candidates == ["company-search-svc"]
 
     def test_excludes_primary_service(self):
         """Primary service name should not appear in candidates."""
         candidates = _derive_service_name_candidates(
-            "mercari.platform.searchadapter.api.v2.SearchService",
-            "mercari-searchadapter-jp",
+            "myorg.platform.searchadapter.api.v2.SearchService",
+            "company-adapter-svc",
         )
-        assert "mercari-searchadapter-jp" not in candidates
+        assert "company-adapter-svc" not in candidates
 
     def test_short_names_excluded(self):
         """Names shorter than 3 chars should be excluded."""
@@ -1048,10 +1048,10 @@ class TestDeriveServiceNameCandidates:
     def test_protobuf_skips_platform(self):
         """Domain parts should try skipping 'platform' namespace."""
         candidates = _derive_service_name_candidates(
-            "mercari.platform.searchx.api.v1.Service",
-            "mercari-home-jp",
+            "myorg.platform.search.api.v1.Service",
+            "company-home-svc",
         )
-        assert "mercari-searchx" in candidates
+        assert "company-search" in candidates
 
 
 class TestDeriveNamespaceCandidates:
@@ -1060,17 +1060,17 @@ class TestDeriveNamespaceCandidates:
     def test_generates_env_suffixed_candidates(self):
         """Should generate namespace candidates with env suffixes."""
         candidates = _derive_namespace_candidates(
-            "mercari.platform.searchtagjp.api.v2.TagSuggestService",
-            "mercari-searchadapter-jp",
+            "myorg.platform.tags.api.v2.TagSuggestService",
+            "company-adapter-svc",
         )
         assert any("prod" in c for c in candidates)
-        assert any("searchtagjp" in c for c in candidates)
+        assert any("tags" in c for c in candidates)
 
     def test_uses_service_candidates_as_base(self):
         """Namespace candidates should be based on service name candidates."""
         candidates = _derive_namespace_candidates(
             "query_suggest_component",
-            "mercari-searchadapter-jp",
+            "company-adapter-svc",
         )
         assert any("query-suggest" in c or "query_suggest" in c for c in candidates)
 
@@ -1081,9 +1081,9 @@ class TestBuildDownstreamQueriesExtended:
     def test_includes_k8s_events(self):
         """Downstream queries should include Kubernetes event query."""
         queries = DepthPhase._build_downstream_queries(
-            "mercari-searchx-jp", "mercari-searchx-jp-prod",
+            "company-search-svc", "company-search-svc-prod",
             IncidentQuery(
-                service="mercari-searchadapter-jp",
+                service="company-adapter-svc",
                 symptom_type=SymptomType.LATENCY,
                 start_time=datetime.now(timezone.utc),
                 end_time=datetime.now(timezone.utc),
@@ -1097,9 +1097,9 @@ class TestBuildDownstreamQueriesExtended:
     def test_includes_monitors(self):
         """Downstream queries should include triggered monitors."""
         queries = DepthPhase._build_downstream_queries(
-            "searchx-jp", "",
+            "search-jp", "",
             IncidentQuery(
-                service="mercari-searchadapter-jp",
+                service="company-adapter-svc",
                 symptom_type=SymptomType.LATENCY,
                 start_time=datetime.now(timezone.utc),
                 end_time=datetime.now(timezone.utc),
@@ -1114,31 +1114,32 @@ class TestBuildDownstreamQueriesExtended:
 class TestProtobufCoveredBy:
     def test_protobuf_covered_by_matching_service(self):
         """Protobuf name with keyword matching a resolved service should be covered."""
-        resolved = {"mercari-searchtagjp-jp", "mercari-campaign-jp"}
+        resolved = {"company-tags-svc", "company-campaign-svc"}
         assert _protobuf_covered_by(
-            "mercari.platform.searchtagjp.api.v2.TagSuggestService", resolved
+            "myorg.platform.tags.api.v2.TagSuggestService", resolved
         ) is True
 
     def test_protobuf_not_covered_by_unrelated_services(self):
         """Protobuf name with no matching resolved service should not be covered."""
-        resolved = {"mercari-campaign-jp", "mercari-home-jp"}
+        resolved = {"company-campaign-svc", "company-home-svc"}
         assert _protobuf_covered_by(
-            "mercari.platform.searchtagjp.api.v2.TagSuggestService", resolved
+            "myorg.platform.tags.api.v2.TagSuggestService", resolved
         ) is False
 
     def test_protobuf_short_keywords_skipped(self):
         """Short domain parts (<4 chars) should not be used for matching."""
-        resolved = {"mercari-api-jp"}
+        resolved = {"company-api-jp"}
         # "api" is too short and in exclusion list, so no keyword matches
         assert _protobuf_covered_by(
-            "mercari.platform.api.v2.SomeService", resolved
+            "myorg.platform.api.v2.SomeService", resolved
         ) is False
 
     def test_protobuf_no_keywords(self):
         """Protobuf name with only excluded parts should not match."""
-        resolved = {"mercari-something-jp"}
+        resolved = {"company-something-prod"}
+        # "internal" and "api" are both excluded/too short, so no keyword matches
         assert _protobuf_covered_by(
-            "mercari.api.v2.Service", resolved
+            "internal.api.v2.Service", resolved
         ) is False
 
 
@@ -1168,13 +1169,13 @@ class TestResolveViaResourceName:
             if "resource_name:" in query:
                 return [TraceSpan(
                     trace_id="abc", span_id="s1",
-                    service="mercari-searchtagjp-jp",
+                    service="company-tags-svc",
                     operation="grpc.server",
-                    resource="/mercari.platform.searchtagjp.api.v2.TagSuggestService/Suggest",
+                    resource="/myorg.platform.tags.api.v2.TagSuggestService/Suggest",
                     duration_ns=100_000_000,
                     start_time=datetime.now(timezone.utc),
                     status="ok",
-                    meta={"kube_namespace": "mercari-searchtagjp-jp-prod"},
+                    meta={"kube_namespace": "company-tags-svc-prod"},
                 )]
             return []  # service:candidate searches return empty
 
@@ -1182,7 +1183,7 @@ class TestResolveViaResourceName:
         dd.query_metrics = AsyncMock(return_value=[])
 
         incident = IncidentQuery(
-            service="mercari-searchadapter-jp",
+            service="company-adapter-svc",
             symptom_type=SymptomType.LATENCY,
             start_time=datetime.now(timezone.utc) - timedelta(minutes=20),
             end_time=datetime.now(timezone.utc),
@@ -1190,10 +1191,10 @@ class TestResolveViaResourceName:
         )
 
         resolved_name, resolved_ns = await depth._resolve_downstream_service_name(
-            "mercari.platform.searchtagjp.api.v2.TagSuggestService", "", incident,
+            "myorg.platform.tags.api.v2.TagSuggestService", "", incident,
         )
-        assert resolved_name == "mercari-searchtagjp-jp"
-        assert resolved_ns == "mercari-searchtagjp-jp-prod"
+        assert resolved_name == "company-tags-svc"
+        assert resolved_ns == "company-tags-svc-prod"
 
     @pytest.mark.asyncio
     async def test_non_protobuf_skips_resource_name(self):
@@ -1212,10 +1213,10 @@ class TestResolveViaResourceName:
         queries_made = []
         async def mock_search_traces(query, start, end, limit=None):
             queries_made.append(query)
-            if "service:mercari-campaign-jp" in query:
+            if "service:company-campaign-svc" in query:
                 return [TraceSpan(
                     trace_id="abc", span_id="s1",
-                    service="mercari-campaign-jp",
+                    service="company-campaign-svc",
                     operation="grpc.server", resource="GetData",
                     duration_ns=100_000, start_time=datetime.now(timezone.utc),
                     status="ok",
@@ -1226,7 +1227,7 @@ class TestResolveViaResourceName:
         dd.query_metrics = AsyncMock(return_value=[])
 
         incident = IncidentQuery(
-            service="mercari-searchadapter-jp",
+            service="company-adapter-svc",
             symptom_type=SymptomType.LATENCY,
             start_time=datetime.now(timezone.utc) - timedelta(minutes=20),
             end_time=datetime.now(timezone.utc),
@@ -1234,8 +1235,8 @@ class TestResolveViaResourceName:
         )
 
         resolved_name, _ = await depth._resolve_downstream_service_name(
-            "mercari-campaign-jp", "", incident,
+            "company-campaign-svc", "", incident,
         )
-        assert resolved_name == "mercari-campaign-jp"
+        assert resolved_name == "company-campaign-svc"
         # Should NOT have made a resource_name search
         assert not any("resource_name:" in q for q in queries_made)

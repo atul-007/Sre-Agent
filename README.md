@@ -211,7 +211,7 @@ The agent fetches metrics (latency, error rate, throughput, CPU, memory, disk I/
 
 ### Dependency Chain Tracking
 
-When the depth phase investigates downstream services, it records the hop-by-hop path (e.g., `search-platform → mercari-authority → mercari-authority-spanner`). This chain is:
+When the depth phase investigates downstream services, it records the hop-by-hop path (e.g., `api-gateway → auth-service → auth-db`). This chain is:
 - Passed to Claude's conclusion prompt so the root cause description includes the full path
 - Stored in the report as `dependency_chain`
 - Rendered in both Markdown and Slack reports with service roles (root cause / propagator / victim)
