@@ -217,8 +217,12 @@ class SlackBot:
         """Start the Slack bot (blocking)."""
         if self.config.slack.socket_mode:
             logger.info("Starting Slack bot in Socket Mode...")
-            handler = AsyncSocketModeHandler(self.app, self.config.slack.app_token)
-            asyncio.get_event_loop().run_until_complete(handler.start_async())
+
+            async def _run_socket_mode() -> None:
+                handler = AsyncSocketModeHandler(self.app, self.config.slack.app_token)
+                await handler.start_async()
+
+            asyncio.run(_run_socket_mode())
         else:
             logger.info("Starting Slack bot in HTTP mode on port %d...", self.config.slack.port)
             self.app.start(port=self.config.slack.port)

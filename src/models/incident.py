@@ -236,6 +236,7 @@ class InvestigationState(BaseModel):
     changes_detected: list[dict[str, Any]] = Field(default_factory=list)
     symptom_type: str = ""  # e.g. "error_rate", "latency" — for conclusion guards
     depth_entry_confidence: float = 0.0  # confidence when entering depth phase (used as floor)
+    dependency_path: list[str] = Field(default_factory=list)  # hop-by-hop: ["primary", "svcA", "svcB"]
 
 
 class InvestigationActionType(str, Enum):
@@ -307,3 +308,5 @@ class RCAReport(BaseModel):
     signal_quality_summary: dict[str, Any] = Field(default_factory=dict)
     report_type: str = "rca"  # "rca" or "investigation_summary"
     recommended_next_steps: list[str] = Field(default_factory=list)
+    dependency_chain: list[str] = Field(default_factory=list)  # root cause svc → ... → alerted svc
+    affected_service_details: list[dict[str, str]] = Field(default_factory=list)  # [{name, role, detail}]

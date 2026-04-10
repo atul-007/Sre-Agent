@@ -50,6 +50,24 @@ class ReportFormatter:
                 lines.append(f"- {ev}")
             lines.append("")
 
+        # Dependency Path
+        dep_chain = getattr(report, "dependency_chain", [])
+        if dep_chain and len(dep_chain) > 1:
+            lines.append("## Dependency Path")
+            role_map: dict[str, str] = {}
+            for detail in getattr(report, "affected_service_details", []):
+                if isinstance(detail, dict):
+                    role_map[detail.get("name", "")] = detail.get("role", "")
+            chain_parts = []
+            for svc in dep_chain:
+                role = role_map.get(svc, "")
+                if role:
+                    chain_parts.append(f"{svc} ({role})")
+                else:
+                    chain_parts.append(svc)
+            lines.append(" → ".join(chain_parts))
+            lines.append("")
+
         # Contributing Factors
         if report.contributing_factors:
             lines.append("## Contributing Factors")
@@ -84,8 +102,20 @@ class ReportFormatter:
         if report.affected_services:
             lines.append("")
             lines.append("**Affected Services:**")
+            detail_map: dict[str, dict[str, str]] = {}
+            for detail in getattr(report, "affected_service_details", []):
+                if isinstance(detail, dict):
+                    detail_map[detail.get("name", "")] = detail
             for svc in report.affected_services:
-                lines.append(f"- {svc}")
+                d = detail_map.get(svc, {})
+                role = d.get("role", "")
+                desc = d.get("detail", "")
+                if role and desc:
+                    lines.append(f"- **{svc}** — *{role}* ({desc})")
+                elif role:
+                    lines.append(f"- **{svc}** — *{role}*")
+                else:
+                    lines.append(f"- {svc}")
         lines.append("")
 
         # Remediation
@@ -251,6 +281,20 @@ class ReportFormatter:
             },
         ]
 
+        # Dependency path
+        dep_chain = getattr(report, "dependency_chain", [])
+        if dep_chain and len(dep_chain) > 1:
+            chain_str = " → ".join(dep_chain)
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":rotating_light: *Dependency Path:*\n{chain_str}",
+                    },
+                }
+            )
+
         if report.remediation_steps:
             steps_text = "\n".join(
                 f"• {step}" for step in report.remediation_steps[:5]
@@ -281,15 +325,29 @@ class ReportFormatter:
                 }
             )
 
-        # Affected services
+        # Affected services (with roles if available)
         if report.affected_services:
-            services_text = ", ".join(report.affected_services)
+            detail_map: dict[str, dict[str, str]] = {}
+            for detail in getattr(report, "affected_service_details", []):
+                if isinstance(detail, dict):
+                    detail_map[detail.get("name", "")] = detail
+            svc_lines = []
+            for svc in report.affected_services:
+                d = detail_map.get(svc, {})
+                role = d.get("role", "")
+                desc = d.get("detail", "")
+                if role and desc:
+                    svc_lines.append(f"• *{svc}* — _{role}_ ({desc})")
+                elif role:
+                    svc_lines.append(f"• *{svc}* — _{role}_")
+                else:
+                    svc_lines.append(f"• {svc}")
             blocks.append(
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Service Impact:* {services_text}",
+                        "text": f"*Service Impact:*\n" + "\n".join(svc_lines),
                     },
                 }
             )

@@ -4,6 +4,14 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
+
+# Load .env file if present (before importing settings that read env vars)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:
+    pass
 
 from config.settings import AgentConfig
 from src.slack.handler import SlackBot

@@ -313,6 +313,9 @@ INVESTIGATION_CONCLUSION_PROMPT = """You have completed a {step_count}-step inve
 **Incident:**
 {incident_summary}
 
+**Dependency Path Discovered:**
+{dependency_path}
+
 **Full Investigation Trace:**
 {full_trace}
 
@@ -321,27 +324,38 @@ INVESTIGATION_CONCLUSION_PROMPT = """You have completed a {step_count}-step inve
 
 Based on the ENTIRE investigation, provide the final root cause analysis.
 
+IMPORTANT: The root cause description MUST clarify the full dependency path.
+If the alerted service is affected by an issue in a downstream dependency,
+state explicitly which service owns the failing component and the exact path
+through which it impacts the alerted service. For example:
+"Spanner query timeouts in mercari-authority-spanner caused auth failures in
+mercari-authority, which cascaded into search-platform via authentication dependency"
+
+Remediation steps MUST specify which service/team should take each action.
+
 Structure your response as JSON:
 {{
-    "summary": "<1-3 sentence summary of what happened and why>",
+    "summary": "<2-4 sentence summary: what happened, the dependency path, and the user-facing impact>",
     "root_cause": {{
-        "description": "<clear description of the root cause>",
+        "description": "<MUST include the full dependency path and which service owns the failing component>",
         "confidence": 0.0,
         "supporting_evidence": ["<specific evidence point 1>", "<evidence 2>"],
         "contradicting_evidence": ["<any contradicting evidence>"]
     }},
     "contributing_factors": [
-        {{"description": "<factor>", "confidence": 0.0}}
+        {{"description": "<factor — specify which service>", "confidence": 0.0}}
     ],
-    "causal_chain": "<describe the exact chain: trigger -> propagation -> symptoms>",
-    "affected_services": ["<service1>"],
-    "blast_radius": "<Low/Medium/High/Critical: X of Y services affected>",
+    "dependency_chain": ["<root cause service>", "<intermediate service>", "<alerted service>"],
+    "affected_services": [
+        {{"name": "<service>", "role": "<root_cause|propagator|victim>", "detail": "<what happened in this service>"}}
+    ],
+    "blast_radius": "<Low/Medium/High/Critical: X of Y services affected, with dependency path>",
     "remediation_steps": [
-        "<immediate action 1>",
-        "<short-term fix>",
-        "<long-term improvement>"
+        "<[service-name] immediate action>",
+        "<[service-name] short-term fix>",
+        "<[service-name] long-term improvement>"
     ],
-    "evidence_chain": ["<evidence item 1>", "<evidence item 2>"]
+    "evidence_chain": ["<evidence item with timestamps>"]
 }}"""
 
 

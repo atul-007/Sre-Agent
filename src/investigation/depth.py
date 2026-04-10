@@ -209,6 +209,9 @@ class DepthPhase:
         services_to_investigate = list(downstream_services)
         hop = 0
 
+        # Track dependency path: start with the alerted service
+        state.dependency_path = [incident.service]
+
         while services_to_investigate and hop < MAX_DOWNSTREAM_HOPS:
             svc_info = services_to_investigate.pop(0)
             svc_name = svc_info["service_name"]
@@ -232,6 +235,10 @@ class DepthPhase:
                 svc_info.get("likely_k8s_namespace", ""),
                 incident, trace, state, accumulated_data, leading, category,
             )
+
+            # Record in dependency path
+            if svc_name not in state.dependency_path:
+                state.dependency_path.append(svc_name)
 
             # If the downstream points to another service, queue it
             if further and further not in investigated:

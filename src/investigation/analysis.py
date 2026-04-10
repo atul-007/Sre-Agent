@@ -158,6 +158,13 @@ class AnalysisPhase:
                 f"{state.total_fetches} total"
             )
 
+        # Format dependency path for the prompt
+        dep_path = state.dependency_path if state else []
+        if dep_path and len(dep_path) > 1:
+            dep_path_str = " → ".join(dep_path)
+        else:
+            dep_path_str = "No multi-service dependency path discovered."
+
         prompt = INVESTIGATION_CONCLUSION_PROMPT.format(
             step_count=trace.total_steps,
             incident_summary=(
@@ -166,6 +173,7 @@ class AnalysisPhase:
                 f"Query: {incident.raw_query}"
                 + extra_context
             ),
+            dependency_path=dep_path_str,
             full_trace=full_trace_str,
             all_data_summary=data_summary,
         )
@@ -247,13 +255,32 @@ class AnalysisPhase:
         if root_cause.confidence < 0.50:
             recommended_next_steps = self._build_next_steps(state, incident)
 
+        # Extract affected services — handle both structured (list of dicts) and flat (list of strings)
+        raw_affected = parsed.get("affected_services", [incident.service])
+        affected_names: list[str] = []
+        affected_details: list[dict] = []
+        for item in raw_affected:
+            if isinstance(item, dict):
+                affected_details.append(item)
+                affected_names.append(item.get("name", ""))
+            elif isinstance(item, str):
+                affected_names.append(item)
+                affected_details.append({"name": item, "role": "unknown", "detail": ""})
+        if not affected_names:
+            affected_names = [incident.service]
+
+        # Dependency chain: prefer Claude's parsed chain, fall back to state tracking
+        dep_chain = parsed.get("dependency_chain", [])
+        if not dep_chain and state and state.dependency_path:
+            dep_chain = list(state.dependency_path)
+
         return RCAReport(
             incident=incident,
             summary=parsed.get("summary", root_cause.description),
             root_cause=root_cause,
             contributing_factors=contributing,
             timeline=timeline,
-            affected_services=parsed.get("affected_services", [incident.service]),
+            affected_services=affected_names,
             blast_radius=parsed.get("blast_radius", "Unknown"),
             remediation_steps=parsed.get("remediation_steps", []),
             confidence_score=root_cause.confidence,
@@ -265,6 +292,8 @@ class AnalysisPhase:
             signal_quality_summary=signal_quality_summary,
             report_type=report_type,
             recommended_next_steps=recommended_next_steps,
+            dependency_chain=dep_chain,
+            affected_service_details=affected_details,
         )
 
     # ── Hypothesis management ─────────────────────────────────────────
