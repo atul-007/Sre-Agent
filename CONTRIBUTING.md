@@ -36,15 +36,23 @@
 ```
 src/
   core/           # Orchestrator, query parser
-  models/         # Pydantic data models (incident, traces, metrics)
+  models/         # Pydantic data models (incident, traces, metrics, investigation state)
   datadog/        # Datadog API client and data fetcher
   claude/         # LLM reasoning engine and prompt templates
-  investigation/  # Investigation engine — breadth, depth, analysis phases
+  investigation/  # Dynamic investigation engine
+    engine.py     #   Main investigation loop
+    discovery.py  #   Phase 0: service context discovery (metrics, namespace, dashboards)
+    breadth.py    #   Phase 1: broad signal collection
+    depth.py      #   Phase 2: hypothesis deep-dive + cross-service dependency tracking
+    analysis.py   #   Hypothesis management + conclusion generation
+    execution.py  #   Action dispatch to data sources
+    rules.py      #   Signal checklists, conclusion guards, phase transitions
+    helpers.py    #   Data summarization utilities
   correlation/    # Timeline building and signal correlation
-  rca/            # Root cause analysis orchestration
-  formatters/     # Report output (markdown, slack, compact)
+  rca/            # Static 4-pass root cause analysis (legacy mode)
+  formatters/     # Report output (markdown, slack blocks, compact)
   slack/          # Slack bot handler, alert parser, incident builder
-  utils/          # Time utilities
+  utils/          # Time utilities (UTC normalization, safe parsing)
 config/           # Settings (dataclasses loaded from env vars)
 tests/            # Unit tests (pytest + pytest-asyncio)
 examples/         # Demo with mock data
@@ -143,6 +151,7 @@ When adding tests:
 2. Add the action type in `src/models/incident.py` (`InvestigationActionType`)
 3. Wire it into `src/investigation/execution.py` for data fetching
 4. Add depth query templates in `src/investigation/depth.py` (`build_depth_queries`)
+5. Add the signal to the checklist in `src/investigation/rules.py` if it should be tracked
 
 **New signal type:**
 1. Add to the signal checklist in `src/investigation/rules.py`
@@ -152,6 +161,12 @@ When adding tests:
 **New report format:**
 1. Add a formatter in `src/formatters/`
 2. Register it in the orchestrator (`src/core/orchestrator.py`)
+
+**New investigation phase or behavior:**
+1. Phase transitions are controlled in `src/investigation/engine.py`
+2. Conclusion guards live in `src/investigation/rules.py`
+3. Prompt templates for Claude reasoning in `src/claude/prompts.py`
+4. Hypothesis tracking and merge logic in `src/investigation/analysis.py`
 
 ## Questions?
 
