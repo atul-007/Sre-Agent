@@ -13,8 +13,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 from config.settings import AgentConfig
 from src.core.orchestrator import SREAgent
-from src.formatters.report import ReportFormatter, _action_emoji
-from src.models.incident import InvestigationStep
+from src.formatters.report import ReportFormatter
 from src.slack.incident_builder import build_incident_from_alert
 from src.slack.parser import parse_datadog_alert_message
 from src.slack.utils import format_error_blocks, sanitize_error, truncate_blocks
@@ -149,36 +148,10 @@ class SlackBot:
                     incident.end_time,
                 )
 
-                # Build live step callback for real-time Slack updates
-                async def on_step_complete(step: InvestigationStep) -> None:
-                    emoji = _action_emoji(step.action.value)
-                    findings_preview = step.findings[:200]
-                    if len(step.findings) > 200:
-                        findings_preview += "..."
-                    hyp_text = ""
-                    if step.hypotheses:
-                        hyp_text = "\n    _Hypotheses: " + "; ".join(
-                            h[:60] for h in step.hypotheses[:3]
-                        ) + "_"
-                    step_text = (
-                        f"{emoji} *Step {step.step_number}:* {step.reason}\n"
-                        f"    _Source: {step.data_source} | "
-                        f"Data: {step.data_summary}_\n"
-                        f"    {findings_preview}"
-                        f"{hyp_text}\n"
-                        f"    Confidence: {step.confidence:.0%}"
-                    )
-                    await client.chat_postMessage(
-                        channel=channel,
-                        thread_ts=thread_ts,
-                        text=step_text,
-                    )
-
-                # Run the investigation with live updates
+                # Run the investigation (no per-step messages — only the final report)
                 report = await agent.investigate_from_incident(
                     incident,
                     mode="dynamic",
-                    on_step_complete=on_step_complete,
                 )
 
                 # Format and post results
