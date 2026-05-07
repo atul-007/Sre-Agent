@@ -338,6 +338,20 @@ through which it impacts the alerted service. For example:
 "Database query timeouts in auth-db caused authentication failures in
 auth-service, which cascaded into api-gateway via authentication dependency"
 
+CRITICAL — TRACE BOTTLENECK GATE:
+If the "Trace Bottleneck Analysis" section above indicates dominant_location
+is "self" (i.e., the alerted service is internally bottlenecked and
+downstream calls return in <100ms), you MUST NOT attribute the root cause to
+a downstream service. Temporal correlation alone (errors in service X happen
+during the alert window) is NOT causation. If self-time dominates traces,
+root cause candidates are:
+- Internal: goroutine/thread contention, GC pressure, lock contention, slow
+  code path, capacity gap during traffic ramp, HPA scaling lag, queueing in
+  middleware
+- Infra: per-pod resource exhaustion, autoscaler churn, zone rebalancing
+
+Conversely, if dominant_location is "downstream", focus on that named service.
+
 Remediation steps MUST specify which service/team should take each action.
 
 Structure your response as JSON:

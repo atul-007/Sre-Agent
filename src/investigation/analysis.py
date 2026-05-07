@@ -12,6 +12,7 @@ from src.claude.prompts import (
 )
 from src.claude.reasoning import ClaudeReasoning
 from src.correlation.engine import CorrelationEngine
+from src.correlation.trace_bottleneck import compute_trace_bottleneck
 from src.investigation.helpers import (
     ensure_str_list,
     format_current_hypotheses,
@@ -157,6 +158,23 @@ class AnalysisPhase:
                 f"\n\n**Data Gaps:** {len(state.data_gap_log)} empty fetches out of "
                 f"{state.total_fetches} total"
             )
+
+        # Trace bottleneck analysis — distinguish self-bound from downstream-bound.
+        # This is the decisive signal: if the alerted service spends most of its
+        # time inside its own code (not in downstream calls), then a downstream-cause
+        # hypothesis is wrong regardless of how many error logs fired in downstream
+        # services during the same window.
+        bottleneck_summary = ""
+        if accumulated_data.traces:
+            bottleneck = compute_trace_bottleneck(
+                accumulated_data.traces, primary_service=incident.service
+            )
+            if bottleneck.dominant_location != "unknown":
+                bottleneck_summary = bottleneck.summary()
+                extra_context += (
+                    f"\n\n**Trace Bottleneck Analysis (CRITICAL — read carefully):**\n"
+                    f"{bottleneck_summary}"
+                )
 
         # Format dependency path for the prompt
         dep_path = state.dependency_path if state else []
