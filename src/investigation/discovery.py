@@ -245,6 +245,56 @@ class DiscoveryPhase:
         except Exception as e:
             logger.warning("  Infrastructure event discovery failed: %s", e)
 
+        # Application-layer changes — feature flags, code changes, config rollouts.
+        # These are common incident triggers that aren't captured by k8s/IaC sources.
+        # Sources here are best-effort — if a team doesn't pipe them to DD events,
+        # the call returns empty and we move on.
+        try:
+            app_change_sources = [
+                "github",            # PRs, releases, tags
+                "gitlab",            # PRs, releases
+                "launchdarkly",      # feature flag toggles
+                "split",             # split.io feature flags
+                "unleash",           # feature flag service
+                "statsig",           # feature flags / experiments
+                "configcat",         # feature flag service
+                "consul",            # config / service discovery changes
+                "etcd",              # config changes
+                "vault",             # secret rotations
+                "argocd",            # gitops deployments
+                "spinnaker",         # pipeline deployments
+                "flagsmith",         # feature flags
+                "harness",           # CI/CD
+                "circleci",          # CI/CD
+                "buildkite",         # CI/CD
+            ]
+            app_events = await self.dd_client.get_events(
+                lookback_start, incident.end_time,
+                tags=[f"service:{incident.service}"],
+                sources=app_change_sources,
+            )
+            for event in app_events:
+                delta = (incident.start_time - event.timestamp).total_seconds() / 60
+                # Classify by source family for better attribution downstream
+                src_lower = (event.source or "").lower()
+                if src_lower in ("github", "gitlab"):
+                    change_type = "code_change"
+                elif src_lower in ("launchdarkly", "split", "unleash", "statsig", "configcat", "flagsmith"):
+                    change_type = "feature_flag"
+                elif src_lower in ("consul", "etcd", "vault"):
+                    change_type = "config_change"
+                else:
+                    change_type = "ci_cd"
+                changes.append({
+                    "type": change_type,
+                    "timestamp": event.timestamp.isoformat(),
+                    "description": event.title,
+                    "source": event.source,
+                    "time_to_incident_minutes": round(delta, 1),
+                })
+        except Exception as e:
+            logger.warning("  Application change discovery failed: %s", e)
+
         changes.sort(key=lambda c: c["timestamp"])
         if changes:
             logger.info("  Discovered %d changes in 2h lookback", len(changes))
