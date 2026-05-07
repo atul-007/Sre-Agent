@@ -108,6 +108,17 @@ class InvestigationEngine:
                         if k not in incident.source_tags:
                             incident.source_tags[k] = v
 
+                # Adaptive checklist: prepend dashboard metrics as
+                # high-priority signals now that we know what the team monitors.
+                if discovered.dashboard_metrics:
+                    self.state.signal_checklist = build_signal_checklist(
+                        incident.symptom_type.value, discovered=discovered
+                    )
+                    logger.info(
+                        "Adaptive checklist: added %d dashboard metric signals",
+                        sum(1 for k in self.state.signal_checklist if k.startswith("dashboard:")),
+                    )
+
                 # Log discovery as step 0
                 discovery_summary_parts = []
                 if discovered.available_metrics:

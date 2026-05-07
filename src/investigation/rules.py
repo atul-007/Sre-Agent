@@ -9,6 +9,7 @@ import logging
 from typing import Optional
 
 from src.models.incident import (
+    DiscoveredContext,
     HypothesisStatus,
     InvestigationActionType,
     InvestigationState,
@@ -183,9 +184,32 @@ TAG_FALLBACKS: dict[str, list[str]] = {
 # ── Public functions ──────────────────────────────────────────────────
 
 
-def build_signal_checklist(symptom_type: str) -> dict[str, SignalCheckResult]:
-    """Initialize the required signal checklist for a given symptom type."""
-    signals = REQUIRED_SIGNALS.get(symptom_type, REQUIRED_SIGNALS[SymptomType.UNKNOWN.value])
+def build_signal_checklist(
+    symptom_type: str,
+    discovered: Optional[DiscoveredContext] = None,
+    max_dashboard_signals: int = 5,
+) -> dict[str, SignalCheckResult]:
+    """Initialize the required signal checklist for a given symptom type.
+
+    If a DiscoveredContext is provided, prepend dashboard metrics as
+    high-priority custom signals — these are metrics the team already
+    monitors, so they're the most likely source of meaningful anomaly.
+    Capped at max_dashboard_signals to keep the checklist focused.
+    """
+    signals = list(REQUIRED_SIGNALS.get(symptom_type, REQUIRED_SIGNALS[SymptomType.UNKNOWN.value]))
+
+    if discovered and discovered.dashboard_metrics:
+        # Prepend dashboard metrics, deduplicated and capped.
+        # Use a "dashboard:" prefix so they don't collide with standard signal names.
+        dash_signals = []
+        seen = set(signals)
+        for m in discovered.dashboard_metrics[:max_dashboard_signals]:
+            sig_name = f"dashboard:{m}"
+            if sig_name not in seen:
+                dash_signals.append(sig_name)
+                seen.add(sig_name)
+        signals = dash_signals + signals
+
     return {
         sig: SignalCheckResult(signal_type=sig)
         for sig in signals
@@ -210,6 +234,18 @@ def mark_signals_checked(
     # Infer signals from custom metric queries based on metric name
     if action_type == InvestigationActionType.QUERY_CUSTOM_METRIC.value and query:
         satisfied = list(satisfied) + _infer_signals_from_query(query)
+
+    # Mark dashboard:<metric> signals as checked when the query references them.
+    # Works for any action type, since dashboard metrics may be queried via
+    # query_custom_metric or implicitly satisfied by fetch_metrics calls that
+    # touch the same metric.
+    if query:
+        query_lower = query.lower()
+        for sig in checklist:
+            if sig.startswith("dashboard:"):
+                metric = sig[len("dashboard:"):].lower()
+                if metric in query_lower:
+                    satisfied = list(satisfied) + [sig]
 
     for sig in satisfied:
         if sig in checklist:
@@ -335,21 +371,27 @@ def can_conclude(
     if not checklist:
         return True, "No signal checklist configured"
 
-    total = len(checklist)
-    checked = sum(1 for r in checklist.values() if r.checked)
+    # Dashboard signals (added by adaptive checklist) are optional — they
+    # nudge Claude to investigate team-monitored metrics but don't gate
+    # conclusion. Compute coverage on the required (non-dashboard) signals.
+    required_checklist = {
+        sig: r for sig, r in checklist.items() if not sig.startswith("dashboard:")
+    }
+    total = len(required_checklist)
+    checked = sum(1 for r in required_checklist.values() if r.checked)
     coverage = checked / max(total, 1)
 
     if coverage < min_coverage:
-        unchecked = get_unchecked_signals(checklist)
+        unchecked = [sig for sig, r in required_checklist.items() if not r.checked]
         return False, f"Signal coverage {coverage:.0%} < {min_coverage:.0%}. Missing: {', '.join(unchecked[:5])}"
 
-    # v3: Require data_found for at least 50% of checked signals
+    # v3: Require data_found for at least 50% of checked required signals
     if checked > 0:
-        with_data = sum(1 for r in checklist.values() if r.checked and r.data_found)
+        with_data = sum(1 for r in required_checklist.values() if r.checked and r.data_found)
         data_ratio = with_data / checked
         if data_ratio < 0.5:
             empty_signals = [
-                sig for sig, r in checklist.items() if r.checked and not r.data_found
+                sig for sig, r in required_checklist.items() if r.checked and not r.data_found
             ]
             return False, (
                 f"Only {data_ratio:.0%} of checked signals returned data. "
