@@ -316,6 +316,9 @@ INVESTIGATION_CONCLUSION_PROMPT = """You have completed a {step_count}-step inve
 **Dependency Path Discovered:**
 {dependency_path}
 
+**Team Knowledge (org-specific context — use to inform attribution, false-positive checks, and remediation):**
+{team_knowledge}
+
 **Full Investigation Trace:**
 {full_trace}
 
@@ -323,6 +326,10 @@ INVESTIGATION_CONCLUSION_PROMPT = """You have completed a {step_count}-step inve
 {all_data_summary}
 
 Based on the ENTIRE investigation, provide the final root cause analysis.
+
+If team knowledge identifies a known issue or false-positive pattern that matches the
+findings, surface it explicitly in the summary. If team knowledge names a service owner
+or escalation path, route remediation steps to that team/channel.
 
 IMPORTANT: The root cause description MUST clarify the full dependency path.
 If the alerted service is affected by an issue in a downstream dependency,

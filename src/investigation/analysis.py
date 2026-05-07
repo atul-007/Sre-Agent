@@ -165,6 +165,8 @@ class AnalysisPhase:
         else:
             dep_path_str = "No multi-service dependency path discovered."
 
+        team_knowledge = self.config.team_knowledge or "(none provided — no team_knowledge.md in project root)"
+
         prompt = INVESTIGATION_CONCLUSION_PROMPT.format(
             step_count=trace.total_steps,
             incident_summary=(
@@ -174,6 +176,7 @@ class AnalysisPhase:
                 + extra_context
             ),
             dependency_path=dep_path_str,
+            team_knowledge=team_knowledge,
             full_trace=full_trace_str,
             all_data_summary=data_summary,
         )

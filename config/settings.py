@@ -39,6 +39,34 @@ class SlackConfig:
     port: int = field(default_factory=lambda: int(os.environ.get("SLACK_BOT_PORT", "3000")))
 
 
+def _load_team_knowledge() -> str:
+    """Load team_knowledge.md from project root if present.
+
+    Optional file that lets users encode org-specific facts (service
+    ownership, known issues, false-positive monitors, escalation paths)
+    that get injected into the conclusion prompt.
+    """
+    path_env = os.environ.get("TEAM_KNOWLEDGE_PATH", "")
+    if path_env and os.path.isfile(path_env):
+        path = path_env
+    else:
+        # Default: project root (3 levels up from config/settings.py)
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidate = os.path.join(os.path.dirname(here), "team_knowledge.md")
+        if not os.path.isfile(candidate):
+            return ""
+        path = candidate
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        # Cap at ~10K chars to keep prompt size sane
+        if len(content) > 10_000:
+            content = content[:10_000] + "\n\n[truncated — team_knowledge.md exceeded 10K chars]"
+        return content
+    except OSError:
+        return ""
+
+
 @dataclass(frozen=True)
 class AgentConfig:
     datadog: DatadogConfig = field(default_factory=DatadogConfig)
@@ -61,3 +89,8 @@ class AgentConfig:
     max_depth_steps: int = 10
     max_downstream_steps: int = 15
     auto_per_pod_breakdown: bool = True
+    # v4: Team knowledge loaded from team_knowledge.md (empty if not present)
+    team_knowledge: str = field(default_factory=_load_team_knowledge)
+    # v4: Time-range expansion when initial window has no anomalies
+    enable_time_range_expansion: bool = True
+    time_range_expansion_hours: int = 24

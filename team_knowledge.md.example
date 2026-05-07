@@ -1,0 +1,72 @@
+# Team Knowledge
+
+This file is loaded by the SRE Investigation Agent and prepended to the
+conclusion prompt. Use it to encode team-specific facts that aren't
+obvious from telemetry alone — known issues, ownership, false-positive
+patterns, escalation paths, etc.
+
+Copy this file to `team_knowledge.md` (without `.example`) in the project
+root and edit it for your environment. It is loaded automatically when
+present and silently ignored when missing.
+
+Keep it concise — every line goes into the LLM prompt. Aim for under
+~150 lines total. Use plain language; the model reads markdown well.
+
+---
+
+## Service Ownership
+
+<!-- Map services to owning teams. Helps Claude attribute remediation
+     steps to the right group. -->
+
+- `service-a` — Platform team (#platform-oncall)
+- `service-b` — Search team (#search-oncall)
+- `database-x` — Data team (#data-oncall)
+
+## Known Issues / Recurring Patterns
+
+<!-- Things that have caused incidents before and might cause them again.
+     If Claude sees a similar pattern, it can flag it. -->
+
+- `service-a` has a known memory leak under sustained traffic above
+  10K RPS. Pods OOM-restart roughly every 6 hours when traffic is high.
+  Mitigation: HPA usually catches this; if not, manual restart.
+
+- The Friday batch job in `pipeline-x` always emits a brief error spike
+  between 02:00–02:15 UTC. **This is expected** and should not be
+  flagged as an incident.
+
+## False-Positive Monitors
+
+<!-- Monitors that fire often but aren't real incidents. Claude should
+     down-weight findings sourced primarily from these. -->
+
+- Monitor 12345: synthetic browser test that fails on every deploy of
+  `frontend-app` for ~3 minutes during pod rotation. Not a real outage.
+
+- Monitor 67890: alerts on >0% error rate but the service has a baseline
+  of 0.1% errors from health-check probes. Investigate only if rate >2%.
+
+## Escalation Paths
+
+<!-- Who to page for what. Helps Claude write more actionable
+     remediation steps. -->
+
+- Spanner / database issues → `#data-oncall`
+- Authentication failures → `#identity-oncall`
+- Search relevance / ranking issues → `#search-oncall`
+- Frontend / mobile errors → `#client-oncall`
+
+## Architectural Notes
+
+<!-- Non-obvious facts about how services interact. Especially useful
+     for cross-service investigations where the dependency isn't visible
+     in the service map. -->
+
+- `service-a` calls `service-b` via gRPC, but only for requests where
+  the user has the `experimental` feature flag enabled. If a service-b
+  outage affects only a fraction of service-a traffic, this is why.
+
+- All writes to `database-x` go through `write-proxy` to enforce
+  rate limits. If `write-proxy` is unhealthy, all writes fail even
+  though the database itself is up.
