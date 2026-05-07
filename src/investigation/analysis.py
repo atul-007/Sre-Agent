@@ -23,6 +23,7 @@ from src.investigation.helpers import (
     parse_json_response,
 )
 from src.investigation.rules import (
+    apply_bottleneck_gate,
     calibrate_confidence,
     format_signal_coverage,
 )
@@ -165,16 +166,15 @@ class AnalysisPhase:
         # time inside its own code (not in downstream calls), then a downstream-cause
         # hypothesis is wrong regardless of how many error logs fired in downstream
         # services during the same window.
-        bottleneck_summary = ""
+        bottleneck = None
         if accumulated_data.traces:
             bottleneck = compute_trace_bottleneck(
                 accumulated_data.traces, primary_service=incident.service
             )
             if bottleneck.dominant_location != "unknown":
-                bottleneck_summary = bottleneck.summary()
                 extra_context += (
                     f"\n\n**Trace Bottleneck Analysis (CRITICAL — read carefully):**\n"
-                    f"{bottleneck_summary}"
+                    f"{bottleneck.summary()}"
                 )
 
         # Scaling signal — surface HPA / autoscaler activity. Capacity gaps
@@ -289,6 +289,34 @@ class AnalysisPhase:
             confidence_cap_sparse=self.config.confidence_cap_on_sparse_data,
             confidence_cap_no_evidence=self.config.confidence_cap_no_direct_evidence,
         )
+
+        # Bottleneck gate: if traces show self-bound but root cause names a
+        # downstream service, cap confidence and flag the contradiction.
+        if bottleneck and bottleneck.dominant_location == "self":
+            # Build candidate downstream service list from service map
+            candidate_services = [
+                node.name for node in accumulated_data.service_map
+                if node.name and node.name != incident.service
+            ]
+            # Also consider any service mentioned in the dependency path
+            if state and state.dependency_path:
+                for svc in state.dependency_path:
+                    if svc and svc != incident.service and svc not in candidate_services:
+                        candidate_services.append(svc)
+            new_conf, gate_notes = apply_bottleneck_gate(
+                root_cause_description=root_cause.description,
+                root_cause_confidence=root_cause.confidence,
+                bottleneck_dominant_location=bottleneck.dominant_location,
+                bottleneck_primary_self_ratio=bottleneck.primary_self_time_ratio,
+                primary_service=incident.service,
+                candidate_services=candidate_services,
+                bottleneck_dominant_service=bottleneck.dominant_service,
+            )
+            if gate_notes:
+                root_cause.confidence = new_conf
+                for n in gate_notes:
+                    if n not in root_cause.contradicting_evidence:
+                        root_cause.contradicting_evidence.append(n)
 
         contributing = []
         for i, factor in enumerate(parsed.get("contributing_factors", [])):

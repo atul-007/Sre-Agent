@@ -4,6 +4,7 @@ import pytest
 
 from src.investigation.rules import (
     REQUIRED_SIGNALS,
+    apply_bottleneck_gate,
     build_signal_checklist,
     calibrate_confidence,
     can_conclude,
@@ -294,6 +295,94 @@ class TestFormatSignalCoverage:
         assert "data found" in output
         assert "[ ]" in output
         assert "NOT YET CHECKED" in output
+
+
+class TestApplyBottleneckGate:
+    """The bottleneck gate caps confidence when traces show self-bound but
+    the proposed root cause names a downstream service."""
+
+    def test_self_bound_with_downstream_root_cause_caps_confidence(self):
+        new_conf, notes = apply_bottleneck_gate(
+            root_cause_description="Spanner database timeouts caused auth failures",
+            root_cause_confidence=0.85,
+            bottleneck_dominant_location="self",
+            bottleneck_primary_self_ratio=0.95,
+            primary_service="search-platform",
+            candidate_services=["spanner", "items", "auth-service"],
+            bottleneck_dominant_service="search-platform",
+        )
+        assert new_conf == 0.30
+        assert any("BOTTLENECK GATE" in n for n in notes)
+        assert any("spanner" in n.lower() for n in notes)
+
+    def test_downstream_bound_does_not_fire(self):
+        # When traces agree the bottleneck IS downstream, don't gate.
+        new_conf, notes = apply_bottleneck_gate(
+            root_cause_description="Items service timeouts",
+            root_cause_confidence=0.80,
+            bottleneck_dominant_location="downstream",
+            bottleneck_primary_self_ratio=0.30,
+            primary_service="search-platform",
+            candidate_services=["items"],
+            bottleneck_dominant_service="items",
+        )
+        assert new_conf == 0.80
+        assert notes == []
+
+    def test_self_bound_with_self_root_cause_does_not_fire(self):
+        # Root cause attributes to the primary service — consistent with bottleneck.
+        new_conf, notes = apply_bottleneck_gate(
+            root_cause_description="search-platform goroutine contention under load",
+            root_cause_confidence=0.75,
+            bottleneck_dominant_location="self",
+            bottleneck_primary_self_ratio=0.90,
+            primary_service="search-platform",
+            candidate_services=["spanner", "items"],
+            bottleneck_dominant_service="search-platform",
+        )
+        assert new_conf == 0.75
+        assert notes == []
+
+    def test_low_self_ratio_does_not_fire(self):
+        # Self ratio too low to be decisive — don't gate even if downstream is named.
+        new_conf, notes = apply_bottleneck_gate(
+            root_cause_description="Spanner timeouts",
+            root_cause_confidence=0.70,
+            bottleneck_dominant_location="self",
+            bottleneck_primary_self_ratio=0.45,
+            primary_service="search-platform",
+            candidate_services=["spanner"],
+            bottleneck_dominant_service="search-platform",
+        )
+        assert new_conf == 0.70
+        assert notes == []
+
+    def test_unknown_location_does_not_fire(self):
+        new_conf, notes = apply_bottleneck_gate(
+            root_cause_description="Spanner timeouts",
+            root_cause_confidence=0.70,
+            bottleneck_dominant_location="unknown",
+            bottleneck_primary_self_ratio=0.0,
+            primary_service="search-platform",
+            candidate_services=["spanner"],
+        )
+        assert new_conf == 0.70
+        assert notes == []
+
+    def test_trace_agrees_with_downstream_attribution_does_not_fire(self):
+        # dominant_location is "self" per the input, but dominant_service is a
+        # downstream — interpret as trace data agreeing with Claude. Don't gate.
+        new_conf, notes = apply_bottleneck_gate(
+            root_cause_description="items service slow queries",
+            root_cause_confidence=0.80,
+            bottleneck_dominant_location="self",
+            bottleneck_primary_self_ratio=0.90,
+            primary_service="search-platform",
+            candidate_services=["items"],
+            bottleneck_dominant_service="items",
+        )
+        assert new_conf == 0.80
+        assert notes == []
 
 
 class TestEvidenceDeduplication:

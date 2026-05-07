@@ -455,6 +455,77 @@ def can_conclude(
     return True, "Signal coverage sufficient"
 
 
+def apply_bottleneck_gate(
+    root_cause_description: str,
+    root_cause_confidence: float,
+    bottleneck_dominant_location: str,
+    bottleneck_primary_self_ratio: float,
+    primary_service: str,
+    candidate_services: list[str],
+    bottleneck_dominant_service: str = "",
+) -> tuple[float, list[str]]:
+    """Programmatic guardrail: if traces show the alerted service is internally
+    bottlenecked (self-time dominates), reject any root cause that attributes
+    the issue to a downstream service.
+
+    Returns (adjusted_confidence, contradicting_evidence_notes).
+
+    The prompt-level guidance asks Claude to honor this, but a deterministic
+    gate ensures that even if Claude returns a downstream-cause hypothesis,
+    its confidence is capped and a contradicting evidence note is appended.
+    The gate fires only when:
+      - dominant_location == "self"
+      - primary_self_time_ratio is meaningfully high (>0.6)
+      - root_cause description prominently names a non-primary service
+    """
+    notes: list[str] = []
+
+    if bottleneck_dominant_location != "self":
+        return root_cause_confidence, notes
+    if bottleneck_primary_self_ratio < 0.6:
+        return root_cause_confidence, notes
+
+    desc_lower = root_cause_description.lower()
+    primary_lower = primary_service.lower()
+
+    # Find any downstream service name that appears in the description
+    downstream_mentions: list[str] = []
+    for svc in candidate_services:
+        if not svc or svc == primary_service:
+            continue
+        svc_lower = svc.lower()
+        # Look for service name as a token (not just substring of primary)
+        if svc_lower in desc_lower and svc_lower != primary_lower:
+            downstream_mentions.append(svc)
+
+    if not downstream_mentions:
+        return root_cause_confidence, notes
+
+    # Heuristic: if the description mentions a downstream service AND the
+    # primary service is not itself the bottleneck owner per the trace
+    # analysis, this is a downstream-cause hypothesis that contradicts
+    # the trace evidence.
+    if bottleneck_dominant_service and bottleneck_dominant_service != primary_service:
+        # Trace data agrees with Claude's downstream attribution — don't gate.
+        return root_cause_confidence, notes
+
+    capped = min(root_cause_confidence, 0.30)
+    notes.append(
+        f"BOTTLENECK GATE: trace bottleneck analysis shows {primary_service} is "
+        f"internally bottlenecked (self-time ratio "
+        f"{bottleneck_primary_self_ratio:.0%}), but the proposed root cause "
+        f"attributes the issue to downstream service(s) "
+        f"{', '.join(downstream_mentions)}. Confidence capped at {capped:.0%}; "
+        f"investigate self-time causes (GC pressure, lock contention, capacity gap)."
+    )
+    logger.info(
+        "Bottleneck gate fired: capping confidence %.0f%% -> %.0f%% "
+        "(self-bound, but root cause names downstream %s)",
+        root_cause_confidence * 100, capped * 100, downstream_mentions,
+    )
+    return capped, notes
+
+
 def format_signal_coverage(checklist: dict[str, SignalCheckResult]) -> str:
     """Format signal checklist for inclusion in prompts."""
     if not checklist:
