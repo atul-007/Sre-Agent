@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Optional
 
 from config.settings import AgentConfig
@@ -169,6 +169,38 @@ class InvestigationEngine:
                     incident, trace, self.state, accumulated_data, self.max_steps
                 )
 
+            # ── Phase 2.5: Time-range expansion (one-shot) ───────────
+            # If breadth found essentially nothing in the alert window, the
+            # incident may have started outside the window (delayed alert,
+            # slow-burn issue, manual investigation hours later). Expand
+            # the window backward and re-run a small breadth pass.
+            if (
+                self.config.enable_time_range_expansion
+                and not self.state.window_expanded
+                and not self._time_exceeded()
+                and self._is_signal_void()
+            ):
+                expansion = timedelta(hours=self.config.time_range_expansion_hours)
+                self.state.original_start_time = incident.start_time
+                expanded_start = incident.start_time - expansion
+                incident = incident.model_copy(update={"start_time": expanded_start})
+                self.state.window_expanded = True
+                logger.info(
+                    "Initial window void of signals — expanding backward by %dh "
+                    "(new window: %s to %s)",
+                    self.config.time_range_expansion_hours,
+                    incident.start_time, incident.end_time,
+                )
+                # Reset signal checklist so the expanded pass can re-check signals
+                self.state.signal_checklist = build_signal_checklist(incident.symptom_type.value)
+                # Allow a few extra steps for the expanded pass, but respect overall budget
+                expanded_max = min(
+                    trace.total_steps + 5, self.max_steps + 5
+                )
+                await breadth.run(
+                    incident, trace, self.state, accumulated_data, expanded_max
+                )
+
             # ── Phase 3: Depth (if hypothesis needs it) ──────────────
             # Depth should run when EITHER:
             # 1. Leading hypothesis has meaningful confidence but below "solved" threshold
@@ -249,6 +281,32 @@ class InvestigationEngine:
         return await analysis.generate_final_report(
             incident, trace, accumulated_data, self.state
         )
+
+    # ── Signal void detection ─────────────────────────────────────────
+
+    def _is_signal_void(self) -> bool:
+        """Return True if the breadth pass collected essentially no useful data.
+
+        Heuristic: at least 3 fetches were attempted, >=80% of them returned empty,
+        no hypothesis exceeds 0.30 confidence, and no changes were detected in the
+        window. If all four hold, the alert window likely doesn't contain the
+        actual incident start — expansion is warranted.
+        """
+        if not self.state:
+            return False
+        if self.state.total_fetches < 3:
+            return False  # not enough signal to judge
+        empty_ratio = self.state.empty_fetches / max(self.state.total_fetches, 1)
+        if empty_ratio < 0.8:
+            return False
+        top_confidence = max(
+            (h.confidence for h in self.state.hypotheses.values()), default=0.0
+        )
+        if top_confidence >= 0.30:
+            return False  # we have a real lead, don't waste budget on expansion
+        if self.state.changes_detected:
+            return False  # changes give us something to investigate; don't expand
+        return True
 
     # ── Time budget ───────────────────────────────────────────────────
 

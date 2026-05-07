@@ -237,6 +237,9 @@ class InvestigationState(BaseModel):
     symptom_type: str = ""  # e.g. "error_rate", "latency" — for conclusion guards
     depth_entry_confidence: float = 0.0  # confidence when entering depth phase (used as floor)
     dependency_path: list[str] = Field(default_factory=list)  # hop-by-hop: ["primary", "svcA", "svcB"]
+    # v4: Time-range expansion
+    window_expanded: bool = False  # set True when initial window was empty and we expanded backward
+    original_start_time: Optional[datetime] = None  # preserved when window is expanded, for trace clarity
 
 
 class InvestigationActionType(str, Enum):
