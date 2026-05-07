@@ -186,6 +186,25 @@ class AnalysisPhase:
                 f"{state.scaling_signal.get('summary', '')}"
             )
 
+        # Deployment validation — flag no-op redeploys so the prompt can
+        # disqualify deployment-cause hypotheses when the version did not
+        # actually change.
+        if state and state.changes_detected:
+            deploy_lines: list[str] = []
+            for change in state.changes_detected:
+                if change.get("type") != "deployment":
+                    continue
+                vc = change.get("version_check")
+                if vc:
+                    deploy_lines.append(
+                        f"- {change.get('description', 'deployment')} "
+                        f"({change.get('time_to_incident_minutes', '?')} min before incident): {vc}"
+                    )
+            if deploy_lines:
+                extra_context += (
+                    "\n\n**Deployment Validation:**\n" + "\n".join(deploy_lines)
+                )
+
         # Historical baseline / recurrence detection — distinguish novel events
         # from recurring patterns. If the alert metric has spiked repeatedly over
         # the lookback window, a one-time deployment or config change is unlikely

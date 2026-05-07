@@ -368,6 +368,17 @@ patterns, focus on:
 A "novel event" verdict (only one spike in the lookback window) is consistent
 with a deployment/config-change root cause; a recurring pattern is not.
 
+CRITICAL — DEPLOYMENT VALIDATION GATE:
+If the "Deployment Validation" section reports "NO VERSION CHANGE" for a
+deployment event, you MUST NOT cite that deployment as the root cause or
+even a contributing factor for application-level regressions. A deploy
+event without a version change is a config / annotation / rollback
+redeploy and CANNOT introduce new code. Temporal proximity to the
+incident is not evidence — many incidents start during routine no-op
+redeploys but are caused by something else (traffic ramp, dependency
+issue, capacity limit). Only deployments with confirmed version deltas
+or unknown version state are valid root-cause candidates.
+
 CRITICAL — SCALING SIGNAL:
 If the "Scaling Signal" section reports HPA scaling lag (desired > current)
 or "HIT MAX REPLICAS", the alerted service was capacity-constrained during

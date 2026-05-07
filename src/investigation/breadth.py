@@ -276,10 +276,13 @@ class BreadthPhase:
         if state.changes_detected:
             changes_lines = []
             for change in state.changes_detected:
-                changes_lines.append(
+                line = (
                     f"  - [{change['type']}] {change.get('description', 'unknown')} "
                     f"({change.get('time_to_incident_minutes', '?')} min before incident)"
                 )
+                if change.get("version_check"):
+                    line += f"\n      → {change['version_check']}"
+                changes_lines.append(line)
             changes_context = "\n**Recent Changes:**\n" + "\n".join(changes_lines)
 
         prompt = INVESTIGATION_PLANNING_PROMPT.format(

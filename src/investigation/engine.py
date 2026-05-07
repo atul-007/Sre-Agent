@@ -164,6 +164,14 @@ class InvestigationEngine:
             if not self._time_exceeded():
                 try:
                     changes = await discovery.discover_changes(incident)
+                    # Validate any deployment changes actually moved the version tag
+                    if changes:
+                        try:
+                            changes = await discovery.validate_deployment_changes(
+                                incident, changes
+                            )
+                        except Exception as e:
+                            logger.warning("Deployment validation failed (non-fatal): %s", e)
                     self.state.changes_detected = changes
                     if changes:
                         logger.info(

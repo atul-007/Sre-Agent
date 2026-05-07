@@ -14,6 +14,7 @@ from src.models.incident import (
     DiscoveredContext,
     IncidentQuery,
 )
+from src.utils.time import safe_fromisoformat
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +299,86 @@ class DiscoveryPhase:
         changes.sort(key=lambda c: c["timestamp"])
         if changes:
             logger.info("  Discovered %d changes in 2h lookback", len(changes))
+        return changes
+
+    # ── Deployment validation (image SHA / version delta) ────────────
+
+    async def validate_deployment_changes(
+        self, incident: IncidentQuery, changes: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """For each deployment event, check whether the version actually changed.
+
+        Many "deployment" events are no-op redeploys (config-only rollouts,
+        annotation bumps, manual rollbacks to the same image). When the
+        version tag is identical before and after, the deployment cannot
+        have introduced a code regression — yet incident reports often
+        attribute root cause to it because of temporal proximity. This
+        method annotates each deployment with `version_changed` and the
+        observed versions, so the conclusion prompt can disqualify
+        deployment-cause hypotheses when the version did not actually move.
+
+        Mutates and returns the same `changes` list.
+        """
+        for change in changes:
+            if change.get("type") != "deployment":
+                continue
+            try:
+                deploy_ts = safe_fromisoformat(change["timestamp"])
+            except Exception:
+                continue
+            if not deploy_ts:
+                continue
+
+            # ±10 min window; small enough to attribute to this deploy.
+            before_start = deploy_ts - timedelta(minutes=10)
+            before_end = deploy_ts - timedelta(seconds=30)
+            after_start = deploy_ts + timedelta(seconds=30)
+            after_end = deploy_ts + timedelta(minutes=10)
+
+            try:
+                before_spans = await self.dd_client.search_traces(
+                    f"service:{incident.service}", before_start, before_end, limit=100,
+                )
+                after_spans = await self.dd_client.search_traces(
+                    f"service:{incident.service}", after_start, after_end, limit=100,
+                )
+            except Exception as e:
+                logger.debug("  Trace fetch around deploy %s failed: %s", deploy_ts, e)
+                continue
+
+            versions_before = {
+                s.meta.get("version", "") for s in before_spans if s.meta.get("version")
+            }
+            versions_after = {
+                s.meta.get("version", "") for s in after_spans if s.meta.get("version")
+            }
+
+            change["versions_before"] = sorted(versions_before)
+            change["versions_after"] = sorted(versions_after)
+
+            if not versions_before and not versions_after:
+                # Can't tell — service doesn't tag spans with version
+                change["version_changed"] = None
+                change["version_check"] = "unknown (no version tag on spans)"
+            elif versions_before == versions_after:
+                change["version_changed"] = False
+                change["version_check"] = (
+                    f"NO VERSION CHANGE — spans before and after both ran "
+                    f"version(s) {sorted(versions_before)}. This deployment "
+                    f"event is likely a no-op redeploy (config / annotation / "
+                    f"rollback to same image) and CANNOT have introduced a "
+                    f"code regression."
+                )
+            else:
+                added = versions_after - versions_before
+                removed = versions_before - versions_after
+                change["version_changed"] = True
+                parts = []
+                if added:
+                    parts.append(f"new versions: {sorted(added)}")
+                if removed:
+                    parts.append(f"old versions: {sorted(removed)}")
+                change["version_check"] = "Version delta confirmed — " + "; ".join(parts)
         return changes
 
     # ── Scaling signal (HPA / autoscaler activity) ────────────────────
