@@ -1,0 +1,15 @@
+{
+  "id": "001_example_db_cascade",
+  "description": "Example case template — replace alert+expected with a real recorded incident before relying on this",
+  "alert": "[Triggered] api-gateway error rate above 5%\n\nMonitor: avg(last_5m):avg:trace.http.request.errors{service:api-gateway,env:production} > 0.05\n\nTags: service:api-gateway, env:production, kube_namespace:gateway-prod\n\nSee: https://app.datadoghq.com/monitor/12345?from_ts=1730000000000&to_ts=1730003600000",
+  "expected": {
+    "root_cause_keywords_any": ["dependency", "downstream", "timeout", "database", "auth"],
+    "root_cause_keywords_all": [],
+    "dependency_chain_includes": [],
+    "min_confidence": 0.20,
+    "expected_report_type": "rca",
+    "must_mention_services": ["api-gateway"]
+  },
+  "skip": true,
+  "notes": "Template only — skipped by default. Copy this file with a real recorded alert and remove `skip` to make it run."
+}
