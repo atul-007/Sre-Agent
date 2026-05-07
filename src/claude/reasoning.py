@@ -37,13 +37,15 @@ class ClaudeReasoning:
         """Send a message to Claude and get a response, maintaining conversation context."""
         self.conversation_history.append({"role": "user", "content": user_message})
 
-        response = await self.client.messages.create(
-            model=self.config.model,
-            max_tokens=self.config.max_tokens,
-            temperature=self.config.temperature,
-            system=SYSTEM_PROMPT,
-            messages=self.conversation_history,
-        )
+        create_kwargs: dict = {
+            "model": self.config.model,
+            "max_tokens": self.config.max_tokens,
+            "system": SYSTEM_PROMPT,
+            "messages": self.conversation_history,
+        }
+        if self.config.temperature is not None:
+            create_kwargs["temperature"] = self.config.temperature
+        response = await self.client.messages.create(**create_kwargs)
 
         # Handle different response formats (standard Anthropic vs LiteLLM proxy)
         if hasattr(response, 'content') and response.content:
@@ -165,13 +167,15 @@ class ClaudeReasoning:
         system = system_prompt or INVESTIGATION_SYSTEM_PROMPT
         self.dynamic_history.append({"role": "user", "content": user_message})
 
-        response = await self.client.messages.create(
-            model=self.config.model,
-            max_tokens=self.config.max_tokens,
-            temperature=self.config.temperature,
-            system=system,
-            messages=self.dynamic_history,
-        )
+        create_kwargs: dict = {
+            "model": self.config.model,
+            "max_tokens": self.config.max_tokens,
+            "system": system,
+            "messages": self.dynamic_history,
+        }
+        if self.config.temperature is not None:
+            create_kwargs["temperature"] = self.config.temperature
+        response = await self.client.messages.create(**create_kwargs)
 
         if hasattr(response, "content") and response.content:
             assistant_text = response.content[0].text

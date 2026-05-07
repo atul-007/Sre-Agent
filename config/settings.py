@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,10 @@ class ClaudeConfig:
     base_url: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_BASE_URL", ""))
     model: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"))
     max_tokens: int = 8192
-    temperature: float = 0.2  # Low temp for analytical reasoning
+    # Some newer models (e.g. claude-opus-4-7-lb behind LiteLLM) reject the
+    # temperature parameter as deprecated. Set to None (default) to omit it
+    # from the API call entirely. Set a float to send it for older models.
+    temperature: Optional[float] = None
     max_context_chars: int = 150_000  # Budget for data payload in prompts
 
 

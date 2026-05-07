@@ -38,17 +38,19 @@ async def parse_incident_query(
     if config.base_url:
         client_kwargs["base_url"] = config.base_url
     client = anthropic.AsyncAnthropic(**client_kwargs)
-    response = await client.messages.create(
-        model=config.model,
-        max_tokens=500,
-        temperature=0.0,
-        messages=[
+    create_kwargs: dict = {
+        "model": config.model,
+        "max_tokens": 500,
+        "messages": [
             {
                 "role": "user",
                 "content": PARSE_PROMPT.format(query=query, now=now.isoformat()),
             }
         ],
-    )
+    }
+    if config.temperature is not None:
+        create_kwargs["temperature"] = config.temperature
+    response = await client.messages.create(**create_kwargs)
 
     # Handle different response formats (standard Anthropic vs LiteLLM proxy)
     if hasattr(response, 'content') and response.content:
