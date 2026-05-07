@@ -174,6 +174,23 @@ class InvestigationEngine:
                 except Exception as e:
                     logger.warning("Change discovery failed (non-fatal): %s", e)
 
+            # ── Phase 1.6: Scaling signal (HPA / autoscaler activity) ─
+            # Detects whether pod count changed significantly or HPA fell
+            # behind during the incident window. Capacity gaps and HPA
+            # scaling lag are common silent root causes that aren't
+            # captured by deployment events or generic kubernetes events.
+            if not self._time_exceeded() and self.state.discovered_context:
+                try:
+                    scaling = await discovery.discover_scaling_signal(
+                        incident, self.state.discovered_context
+                    )
+                    if scaling:
+                        self.state.scaling_signal = scaling
+                        if scaling.get("is_significant"):
+                            logger.info("Scaling signal: %s", scaling.get("summary", ""))
+                except Exception as e:
+                    logger.warning("Scaling signal discovery failed (non-fatal): %s", e)
+
             # ── Phase 2: Breadth ─────────────────────────────────────
             if not self._time_exceeded():
                 await breadth.run(

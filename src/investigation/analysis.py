@@ -177,6 +177,15 @@ class AnalysisPhase:
                     f"{bottleneck_summary}"
                 )
 
+        # Scaling signal — surface HPA / autoscaler activity. Capacity gaps
+        # and HPA scaling lag are silent root causes that don't appear in
+        # deployment events or error logs but are decisive when present.
+        if state and state.scaling_signal and state.scaling_signal.get("is_significant"):
+            extra_context += (
+                f"\n\n**Scaling Signal (HPA / autoscaler activity in 2h lookback):**\n"
+                f"{state.scaling_signal.get('summary', '')}"
+            )
+
         # Historical baseline / recurrence detection — distinguish novel events
         # from recurring patterns. If the alert metric has spiked repeatedly over
         # the lookback window, a one-time deployment or config change is unlikely

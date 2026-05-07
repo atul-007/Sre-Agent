@@ -368,6 +368,20 @@ patterns, focus on:
 A "novel event" verdict (only one spike in the lookback window) is consistent
 with a deployment/config-change root cause; a recurring pattern is not.
 
+CRITICAL — SCALING SIGNAL:
+If the "Scaling Signal" section reports HPA scaling lag (desired > current)
+or "HIT MAX REPLICAS", the alerted service was capacity-constrained during
+the incident — pods could not be added fast enough (or at all) to meet
+demand. In this case:
+- Root cause likely involves capacity / autoscaling, not application code
+- "HPA hit max_replicas" means the autoscaler is configured incorrectly OR
+  there is a pod scheduling failure (resource quota, node pressure, taints)
+- Remediation should include raising max_replicas, faster scale-up policy,
+  or reducing per-pod resource consumption
+Significant pod count delta (>30%) without HPA lag is normal scale activity
+and is not by itself a smoking gun — combine with other signals before
+attributing.
+
 Remediation steps MUST specify which service/team should take each action.
 
 Structure your response as JSON:

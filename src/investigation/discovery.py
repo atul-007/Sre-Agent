@@ -300,6 +300,147 @@ class DiscoveryPhase:
             logger.info("  Discovered %d changes in 2h lookback", len(changes))
         return changes
 
+    # ── Scaling signal (HPA / autoscaler activity) ────────────────────
+
+    async def discover_scaling_signal(
+        self, incident: IncidentQuery, ctx: DiscoveredContext
+    ) -> dict[str, Any] | None:
+        """Detect HPA / autoscaler activity during the incident window.
+
+        Queries pod count + HPA replica metrics over a 2h lookback and
+        computes scaling deltas. Returns a structured signal dict if
+        significant scaling activity is detected, else None. This catches
+        cases where capacity gaps drove the incident — pods were still
+        scaling up while traffic spiked, or HPA hit max_replicas and could
+        not keep up. A one-time deployment cannot explain such patterns.
+
+        Returns dict with keys:
+          pod_count_min, pod_count_max, pod_count_delta_pct
+          hpa_desired_max, hpa_current_min, hpa_lag_max  (None if HPA metrics absent)
+          hit_max_replicas: bool
+          summary: human-readable line for the prompt
+        """
+        if not ctx.resolved_namespace and not ctx.resolved_tags:
+            return None
+
+        lookback_start = incident.start_time - timedelta(hours=2)
+
+        if ctx.resolved_tags:
+            tag_filter = ",".join(f"{k}:{v}" for k, v in ctx.resolved_tags.items())
+        else:
+            tag_filter = f"kube_namespace:{ctx.resolved_namespace}"
+
+        signal: dict[str, Any] = {}
+
+        # 1. Pod count over the window — detect scaling deltas
+        pod_count_metrics = [
+            "kubernetes.pods.running",
+            "kubernetes.containers.running",
+        ]
+        pod_values: list[float] = []
+        for pod_metric in pod_count_metrics:
+            try:
+                series_list = await self.dd_client.query_metrics(
+                    f"sum:{pod_metric}{{{tag_filter}}}",
+                    lookback_start, incident.end_time,
+                )
+                pod_values = [
+                    p.value for s in series_list for p in s.points if p.value > 0
+                ]
+                if pod_values:
+                    break
+            except Exception as e:
+                logger.debug("  Pod count query '%s' failed: %s", pod_metric, e)
+
+        if pod_values:
+            pod_min = min(pod_values)
+            pod_max = max(pod_values)
+            delta_pct = ((pod_max - pod_min) / pod_min * 100) if pod_min > 0 else 0.0
+            signal["pod_count_min"] = pod_min
+            signal["pod_count_max"] = pod_max
+            signal["pod_count_delta_pct"] = round(delta_pct, 1)
+
+        # 2. HPA desired vs current — detect scaling lag
+        hpa_lag_max: float | None = None
+        hpa_desired_max: float | None = None
+        hpa_current_min: float | None = None
+        hit_max_replicas = False
+        try:
+            desired_series = await self.dd_client.query_metrics(
+                f"max:kubernetes_state.hpa.desired_replicas{{{tag_filter}}}",
+                lookback_start, incident.end_time,
+            )
+            current_series = await self.dd_client.query_metrics(
+                f"max:kubernetes_state.hpa.current_replicas{{{tag_filter}}}",
+                lookback_start, incident.end_time,
+            )
+            max_replicas_series = await self.dd_client.query_metrics(
+                f"max:kubernetes_state.hpa.max_replicas{{{tag_filter}}}",
+                lookback_start, incident.end_time,
+            )
+
+            desired_vals = [p.value for s in desired_series for p in s.points if p.value > 0]
+            current_vals = [p.value for s in current_series for p in s.points if p.value > 0]
+            max_vals = [p.value for s in max_replicas_series for p in s.points if p.value > 0]
+
+            if desired_vals:
+                hpa_desired_max = max(desired_vals)
+                signal["hpa_desired_max"] = hpa_desired_max
+            if current_vals:
+                hpa_current_min = min(current_vals)
+                signal["hpa_current_min"] = hpa_current_min
+            if desired_vals and current_vals:
+                # Sample-aligned diff is ideal but timeseries may not align — use max gap
+                hpa_lag_max = max(desired_vals) - min(current_vals)
+                signal["hpa_lag_max"] = hpa_lag_max
+            if max_vals and desired_vals:
+                hit_max_replicas = max(desired_vals) >= max(max_vals)
+                signal["hit_max_replicas"] = hit_max_replicas
+        except Exception as e:
+            logger.debug("  HPA metric queries failed: %s", e)
+
+        if not signal:
+            return None
+
+        # Build a summary suitable for the prompt
+        parts: list[str] = []
+        if "pod_count_delta_pct" in signal:
+            delta = signal["pod_count_delta_pct"]
+            if delta >= 30:
+                parts.append(
+                    f"pod count varied by {delta:.0f}% "
+                    f"(min={signal['pod_count_min']:.0f}, max={signal['pod_count_max']:.0f}) "
+                    f"— significant scaling activity"
+                )
+            else:
+                parts.append(
+                    f"pod count stable (delta {delta:.0f}%, "
+                    f"min={signal['pod_count_min']:.0f}, max={signal['pod_count_max']:.0f})"
+                )
+        if hpa_lag_max is not None and hpa_lag_max >= 2:
+            parts.append(
+                f"HPA scaling lag detected: desired peaked at {hpa_desired_max:.0f}, "
+                f"current dipped to {hpa_current_min:.0f} (lag {hpa_lag_max:.0f} replicas)"
+            )
+        if hit_max_replicas:
+            parts.append(
+                "HPA HIT MAX REPLICAS — autoscaler was capped and could not add more pods"
+            )
+
+        if parts:
+            signal["summary"] = "; ".join(parts)
+        else:
+            signal["summary"] = "No significant scaling activity detected."
+
+        # Determine if signal is significant enough to surface
+        is_significant = (
+            signal.get("pod_count_delta_pct", 0) >= 30
+            or (hpa_lag_max is not None and hpa_lag_max >= 2)
+            or hit_max_replicas
+        )
+        signal["is_significant"] = is_significant
+        return signal
+
     # ── Query building from discovered context ────────────────────────
 
     @staticmethod

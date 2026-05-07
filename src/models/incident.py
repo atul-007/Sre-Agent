@@ -240,6 +240,8 @@ class InvestigationState(BaseModel):
     # v4: Time-range expansion
     window_expanded: bool = False  # set True when initial window was empty and we expanded backward
     original_start_time: Optional[datetime] = None  # preserved when window is expanded, for trace clarity
+    # v5: Scaling signal (HPA / autoscaler activity during incident window)
+    scaling_signal: Optional[dict[str, Any]] = None
 
 
 class InvestigationActionType(str, Enum):
