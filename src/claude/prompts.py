@@ -352,6 +352,22 @@ root cause candidates are:
 
 Conversely, if dominant_location is "downstream", focus on that named service.
 
+CRITICAL — RECURRENCE GATE:
+If the "Historical Baseline / Recurrence Analysis" section above flags a
+RECURRING PATTERN (multiple spike events at a roughly periodic cadence over
+the lookback window), you MUST NOT attribute the root cause to a one-time
+deployment, config change, or feature-flag flip — those are by definition
+single-shot events and cannot produce a periodic spike. For recurring
+patterns, focus on:
+- Periodic processes: scheduled jobs (cron, k8s CronJob), batch reconciliation,
+  cache eviction cycles, GC cycles
+- Traffic-driven capacity gaps: HPA scaling lag matching a daily traffic curve,
+  insufficient steady-state capacity at peak hours
+- Autoscaler churn: pods being terminated/recreated periodically
+- Upstream rate-limit windows or token-bucket refill cadences
+A "novel event" verdict (only one spike in the lookback window) is consistent
+with a deployment/config-change root cause; a recurring pattern is not.
+
 Remediation steps MUST specify which service/team should take each action.
 
 Structure your response as JSON:

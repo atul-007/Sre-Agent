@@ -11,6 +11,7 @@ from src.claude.prompts import (
     INVESTIGATION_CONCLUSION_PROMPT,
 )
 from src.claude.reasoning import ClaudeReasoning
+from src.correlation.baseline import detect_recurrence_from_alert_metric
 from src.correlation.engine import CorrelationEngine
 from src.correlation.trace_bottleneck import compute_trace_bottleneck
 from src.investigation.helpers import (
@@ -175,6 +176,26 @@ class AnalysisPhase:
                     f"\n\n**Trace Bottleneck Analysis (CRITICAL — read carefully):**\n"
                     f"{bottleneck_summary}"
                 )
+
+        # Historical baseline / recurrence detection — distinguish novel events
+        # from recurring patterns. If the alert metric has spiked repeatedly over
+        # the lookback window, a one-time deployment or config change is unlikely
+        # to be the root cause. This is what Bits AI used to disqualify our
+        # "deployment caused this" hypothesis on the test9 incident.
+        if accumulated_data.metrics:
+            # Pick the metric with the longest history (most useful for baseline)
+            longest_series = max(
+                accumulated_data.metrics, key=lambda m: len(m.points), default=None
+            )
+            if longest_series and len(longest_series.points) >= 30:
+                recurrence = detect_recurrence_from_alert_metric(
+                    longest_series, incident.start_time, incident.end_time
+                )
+                if recurrence.spike_events:
+                    extra_context += (
+                        f"\n\n**Historical Baseline / Recurrence Analysis:**\n"
+                        f"{recurrence.summary()}"
+                    )
 
         # Format dependency path for the prompt
         dep_path = state.dependency_path if state else []
