@@ -40,17 +40,23 @@ def _extract_service_from_query(query: str) -> str | None:
 async def build_incident_from_alert(
     alert_context: SlackAlertContext,
     dd_client: DatadogClient,
+    message_ts: datetime | None = None,
 ) -> IncidentQuery:
     """Build an IncidentQuery from a Slack alert context.
 
     Fetches the monitor definition from Datadog to extract the full query,
     service name, and threshold information. Falls back to tag-based
     extraction if the monitor fetch fails.
+
+    ``message_ts`` is the timestamp of the parent Slack message (the alert
+    itself). Used to anchor the investigation window when the monitor URL
+    doesn't carry from_ts/to_ts (the common case for Datadog Slack alerts).
     """
     monitor_name = ""
     monitor_query = ""
     monitor_tags: list[str] = []
     thresholds: dict = {}
+    monitor_def: dict = {}
 
     # Fetch monitor definition
     try:
@@ -84,17 +90,55 @@ async def build_incident_from_alert(
         monitor_name or alert_context.alert_title,
     )
 
-    # Determine time window
+    # Determine time window — anchor on the actual alert trigger time, not
+    # the time the user invoked the bot. Priority order:
+    #   1. URL from_ts/to_ts (explicit window — usually only present in
+    #      shared graph snapshots, rarely in standard Slack alerts)
+    #   2. URL to_ts only (anchor end on it, look back 1h)
+    #   3. Trigger timestamp extracted from alert body text
+    #      ("At 2026-05-06 08:41:53 UTC, ...")
+    #   4. Datadog monitor's overall_state_modified epoch
+    #      (set when the monitor last changed state to alerting)
+    #   5. Slack parent message timestamp (when Datadog posted the alert)
+    #   6. Fallback: now - 1h to now
     now = datetime.now(timezone.utc)
+    anchor: datetime | None = None
+    anchor_source = "default"
     if alert_context.from_ts and alert_context.to_ts:
         start_time = alert_context.from_ts
         end_time = alert_context.to_ts
+        anchor_source = "url_window"
     elif alert_context.to_ts:
         start_time = alert_context.to_ts - timedelta(hours=1)
         end_time = alert_context.to_ts
+        anchor_source = "url_to_ts"
     else:
-        start_time = now - timedelta(hours=1)
-        end_time = now
+        if alert_context.triggered_at:
+            anchor = alert_context.triggered_at
+            anchor_source = "alert_text"
+        else:
+            modified_epoch = monitor_def.get("overall_state_modified")
+            if isinstance(modified_epoch, (int, float)) and modified_epoch > 0:
+                try:
+                    anchor = datetime.fromtimestamp(modified_epoch, tz=timezone.utc)
+                    anchor_source = "monitor_state_modified"
+                except (ValueError, OSError):
+                    anchor = None
+        if anchor is None and message_ts is not None:
+            anchor = message_ts
+            anchor_source = "slack_message_ts"
+        if anchor is None:
+            anchor = now
+            anchor_source = "now_fallback"
+        # Window: 1h before the trigger to 10min after, capped at now.
+        start_time = anchor - timedelta(hours=1)
+        end_time = min(anchor + timedelta(minutes=10), now)
+        if end_time <= start_time:
+            end_time = start_time + timedelta(hours=1)
+    logger.info(
+        "Investigation window anchor=%s (source=%s): %s → %s",
+        anchor, anchor_source, start_time, end_time,
+    )
 
     # Determine environment
     environment = (

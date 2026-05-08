@@ -6,6 +6,7 @@ import pytest
 
 from src.slack.parser import (
     SlackAlertContext,
+    _extract_triggered_at,
     extract_tags_from_text,
     parse_datadog_alert_message,
     parse_monitor_url,
@@ -70,6 +71,25 @@ class TestExtractTags:
         assert tags == {}
 
 
+class TestExtractTriggeredAt:
+    def test_at_utc_phrase(self):
+        result = _extract_triggered_at(
+            "At 2026-05-06 08:41:53 UTC, a latency alert was triggered"
+        )
+        assert result == datetime(2026, 5, 6, 8, 41, 53, tzinfo=timezone.utc)
+
+    def test_iso8601_z(self):
+        result = _extract_triggered_at("Triggered at 2026-05-06T08:41:53Z")
+        assert result == datetime(2026, 5, 6, 8, 41, 53, tzinfo=timezone.utc)
+
+    def test_triggered_colon_form(self):
+        result = _extract_triggered_at("Triggered: 2026-05-06 08:41:53 UTC")
+        assert result == datetime(2026, 5, 6, 8, 41, 53, tzinfo=timezone.utc)
+
+    def test_returns_none_when_absent(self):
+        assert _extract_triggered_at("No timestamp here") is None
+
+
 class TestParseDatadogAlertMessage:
     def test_parse_from_text(self):
         text = (
@@ -122,6 +142,31 @@ class TestParseDatadogAlertMessage:
     def test_no_monitor_url_raises(self):
         with pytest.raises(ValueError, match="No Datadog monitor URL"):
             parse_datadog_alert_message("Just a regular message, no links")
+
+    def test_extracts_triggered_at_from_at_phrase(self):
+        text = (
+            "Latency alert\n"
+            "At 2026-05-06 08:41:53 UTC, a latency alert was triggered.\n"
+            "https://app.datadoghq.com/monitors/12345"
+        )
+        ctx = parse_datadog_alert_message(text)
+        assert ctx.triggered_at == datetime(2026, 5, 6, 8, 41, 53, tzinfo=timezone.utc)
+
+    def test_extracts_triggered_at_from_iso8601_z(self):
+        text = (
+            "Triggered at 2026-05-06T08:41:53Z for service api\n"
+            "https://app.datadoghq.com/monitors/12345"
+        )
+        ctx = parse_datadog_alert_message(text)
+        assert ctx.triggered_at == datetime(2026, 5, 6, 8, 41, 53, tzinfo=timezone.utc)
+
+    def test_no_triggered_at_when_absent(self):
+        text = (
+            "Just an alert with no timestamp text.\n"
+            "https://app.datadoghq.com/monitors/12345"
+        )
+        ctx = parse_datadog_alert_message(text)
+        assert ctx.triggered_at is None
 
     def test_real_world_datadog_alert(self):
         """Test with a realistic Datadog Slack alert format."""

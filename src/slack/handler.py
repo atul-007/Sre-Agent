@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 from slack_bolt.async_app import AsyncApp
@@ -134,11 +135,23 @@ class SlackBot:
                 alert_context.group_tags,
             )
 
+            # Slack message ts is "1700000000.123456" (epoch seconds with
+            # microsecond fraction). Used as a fallback anchor for the
+            # investigation window — Datadog posts the alert immediately
+            # when the monitor triggers, so this approximates trigger time.
+            message_ts: datetime | None = None
+            raw_ts = parent_message.get("ts")
+            if raw_ts:
+                try:
+                    message_ts = datetime.fromtimestamp(float(raw_ts), tz=timezone.utc)
+                except (TypeError, ValueError):
+                    message_ts = None
+
             # Build IncidentQuery from alert context
             agent = SREAgent(self.config)
             try:
                 incident = await build_incident_from_alert(
-                    alert_context, agent.dd_client
+                    alert_context, agent.dd_client, message_ts=message_ts,
                 )
                 logger.info(
                     "Built incident: service=%s, symptom=%s, window=%s→%s",

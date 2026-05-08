@@ -39,6 +39,10 @@ class SlackAlertContext:
     threshold: Optional[str] = None
     alert_title: str = ""
     raw_text: str = ""
+    # Best-effort trigger timestamp extracted from alert body text
+    # (e.g. "At 2026-05-06 08:41:53 UTC, ..."). Used as a fallback when the
+    # monitor URL doesn't carry from_ts/to_ts query params.
+    triggered_at: Optional[datetime] = None
 
 
 def parse_monitor_url(url: str) -> dict:
@@ -110,6 +114,36 @@ def _extract_monitor_urls(text: str) -> list[str]:
         f"https://app.datadoghq.com/monitors/{m.group(1)}{m.group(2)}"
         for m in MONITOR_URL_PATTERN.finditer(text)
     ]
+
+
+def _extract_triggered_at(text: str) -> Optional[datetime]:
+    """Best-effort extraction of an alert trigger timestamp from alert body text.
+
+    Datadog Slack notifications commonly include phrases like:
+      - "At 2026-05-06 08:41:53 UTC, a latency alert was triggered..."
+      - "Triggered at 2026-05-06T08:41:53Z"
+      - "Triggered: 2026-05-06 08:41:53 UTC"
+
+    Returns the first match as a timezone-aware UTC datetime, or None.
+    """
+    patterns = [
+        # "At 2026-05-06 08:41:53 UTC"
+        r"\bAt\s+(\d{4}-\d{2}-\d{2})[T\s]+(\d{2}:\d{2}:\d{2})\s*UTC\b",
+        # "Triggered at 2026-05-06T08:41:53Z" or "Triggered: 2026-05-06 08:41:53 UTC"
+        r"[Tt]riggered(?:\s+at)?[:\s]+(\d{4}-\d{2}-\d{2})[T\s]+(\d{2}:\d{2}:\d{2})(?:Z|\s*UTC)?",
+        # ISO 8601 with explicit Z anywhere in text (last resort)
+        r"\b(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})Z\b",
+    ]
+    for pat in patterns:
+        match = re.search(pat, text)
+        if not match:
+            continue
+        date_part, time_part = match.group(1), match.group(2)
+        try:
+            return datetime.fromisoformat(f"{date_part}T{time_part}+00:00")
+        except ValueError:
+            continue
+    return None
 
 
 def _collect_text_from_blocks(blocks: list[dict]) -> str:
@@ -197,6 +231,8 @@ def parse_datadog_alert_message(
     if threshold_match:
         threshold = threshold_match.group(1)
 
+    triggered_at = _extract_triggered_at(combined_text)
+
     return SlackAlertContext(
         monitor_id=url_data["monitor_id"],
         monitor_url=urls[0],
@@ -208,4 +244,5 @@ def parse_datadog_alert_message(
         threshold=threshold,
         alert_title=alert_title,
         raw_text=combined_text,
+        triggered_at=triggered_at,
     )
