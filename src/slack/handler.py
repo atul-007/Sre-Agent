@@ -8,7 +8,9 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from aiohttp import web
 from slack_bolt.async_app import AsyncApp
+from slack_bolt.adapter.aiohttp import to_aiohttp_response, to_bolt_request
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.web.async_client import AsyncWebClient
 
@@ -20,6 +22,11 @@ from src.slack.parser import parse_datadog_alert_message
 from src.slack.utils import format_error_blocks, sanitize_error, truncate_blocks
 
 logger = logging.getLogger(__name__)
+
+
+async def _healthz(_request: web.Request) -> web.Response:
+    """Liveness/readiness endpoint for Cloud Run and other orchestrators."""
+    return web.Response(text="ok", content_type="text/plain")
 
 
 class SlackBot:
@@ -210,5 +217,21 @@ class SlackBot:
 
             asyncio.run(_run_socket_mode())
         else:
-            logger.info("Starting Slack bot in HTTP mode on port %d...", self.config.slack.port)
-            self.app.start(port=self.config.slack.port)
+            port = self.config.slack.port
+            logger.info("Starting Slack bot in HTTP mode on port %d...", port)
+            # Use aiohttp explicitly so we can register a /healthz route
+            # alongside the Slack events handler. Cloud Run startup probes
+            # the container by hitting it; a dedicated healthcheck keeps
+            # them out of the Slack events path.
+            bolt_app = self.app
+
+            async def _slack_events(request: web.Request) -> web.Response:
+                bolt_req = await to_bolt_request(request)
+                bolt_resp = await bolt_app.async_dispatch(bolt_req)
+                return await to_aiohttp_response(bolt_resp)
+
+            web_app = web.Application()
+            web_app.router.add_post("/slack/events", _slack_events)
+            web_app.router.add_get("/healthz", _healthz)
+            web_app.router.add_get("/", _healthz)
+            web.run_app(web_app, host="0.0.0.0", port=port, print=None)

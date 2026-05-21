@@ -40,7 +40,12 @@ class SlackConfig:
     socket_mode: bool = field(
         default_factory=lambda: bool(os.environ.get("SLACK_APP_TOKEN", ""))
     )
-    port: int = field(default_factory=lambda: int(os.environ.get("SLACK_BOT_PORT", "3000")))
+    # Cloud Run injects PORT; SLACK_BOT_PORT is the legacy local-dev override.
+    port: int = field(
+        default_factory=lambda: int(
+            os.environ.get("PORT") or os.environ.get("SLACK_BOT_PORT") or "3000"
+        )
+    )
 
 
 def _load_team_knowledge() -> str:
