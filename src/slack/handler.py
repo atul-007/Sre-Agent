@@ -209,10 +209,27 @@ class SlackBot:
     def start(self) -> None:
         """Start the Slack bot (blocking)."""
         if self.config.slack.socket_mode:
-            logger.info("Starting Slack bot in Socket Mode...")
+            port = self.config.slack.port
+            logger.info(
+                "Starting Slack bot in Socket Mode (healthcheck on :%d)...", port
+            )
 
             async def _run_socket_mode() -> None:
-                handler = AsyncSocketModeHandler(self.app, self.config.slack.app_token)
+                # Start a minimal aiohttp healthcheck server in parallel with
+                # the Socket Mode WebSocket. Cloud Run, Kubernetes and most
+                # orchestrators expect the container to bind $PORT or they
+                # consider the startup probe failed and kill the instance.
+                web_app = web.Application()
+                web_app.router.add_get("/healthz", _healthz)
+                web_app.router.add_get("/", _healthz)
+                runner = web.AppRunner(web_app)
+                await runner.setup()
+                site = web.TCPSite(runner, "0.0.0.0", port)
+                await site.start()
+
+                handler = AsyncSocketModeHandler(
+                    self.app, self.config.slack.app_token
+                )
                 await handler.start_async()
 
             asyncio.run(_run_socket_mode())
